@@ -1,0 +1,17 @@
+services:
+  nbrain:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?Set OPENAI_API_KEY in .env}
+      NBRAIN_AUTH_REQUIRED: "1"
+      NBRAIN_ADMIN_PASSWORD: ${NBRAIN_ADMIN_PASSWORD:?Set NBRAIN_ADMIN_PASSWORD in .env}
+      NBRAIN_SESSION_SECRET: ${NBRAIN_SESSION_SECRET:?Set NBRAIN_SESSION_SECRET in .env}
+      NBRAIN_SECURE_COOKIES: ${NBRAIN_SECURE_COOKIES:-0}
+    volumes:
+      - nbrain_data:/app/data
+    restart: unless-stopped
+
+volumes:
+  nbrain_data:

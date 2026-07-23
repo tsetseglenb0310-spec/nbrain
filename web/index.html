@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>NBrain MVP</title>
+    <link rel="stylesheet" href="/web/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div class="brand"><span class="brand-mark">N</span><span>NBrain <small>AI Director Advisor</small></span></div>
+        <span class="secure-badge">Личная база знаний</span>
+      </header>
+
+      <section class="hero-card" aria-labelledby="hero-title">
+        <p class="eyebrow">СТРАТЕГИЧЕСКАЯ СИСТЕМА ЗНАНИЙ</p>
+        <h1 id="hero-title">Знания, которые ведут к действию.</h1>
+        <p class="subtitle">Исследуйте книги, формируйте решения и превращайте идеи в управленческие шаги.</p>
+        <div class="focus-strip"><span>Текущий фокус</span><strong id="focus-summary">Загрузите профиль, чтобы задать фокус.</strong></div>
+      </section>
+
+      <details class="card profile-card" aria-labelledby="profile-title">
+        <summary>
+          <div><p class="section-label">ПРОФИЛЬ</p><h2 id="profile-title">Профиль Мухамеда Чапанова</h2></div>
+          <span class="summary-hint">Изменить</span>
+        </summary>
+        <div class="profile-content">
+          <p>NBrain использует профиль только для адаптации управленческих советов.</p>
+        <form id="profile-form" class="profile-form">
+          <div class="profile-grid">
+            <label for="director-name">Имя<input id="director-name" maxlength="120" placeholder="Мухамед Чапанов" /></label>
+            <label for="director-focus">Текущий фокус<input id="director-focus" maxlength="1000" placeholder="Например: масштабирование компании" /></label>
+          </div>
+          <label for="director-strengths">CliftonStrengths через запятую<textarea id="director-strengths" rows="2" placeholder="Strategic, Learner, Achiever..."></textarea></label>
+          <label for="director-goals">Цели на ближайший период<textarea id="director-goals" rows="3" placeholder="Например: сформировать стратегию на 12 месяцев"></textarea></label>
+          <div class="form-actions"><button id="profile-save" type="submit">Сохранить профиль</button></div>
+        </form>
+        <p id="profile-status" class="status" aria-live="polite"></p>
+        </div>
+      </details>
+
+      <section class="card upload-card" aria-labelledby="upload-title">
+        <div>
+          <p class="section-label">2. БИБЛИОТЕКА</p>
+          <h2 id="upload-title">Загрузить и проиндексировать книгу</h2>
+          <p>Поддерживаются PDF с текстовым слоем, EPUB и TXT. Размер файла — до 50 МБ.</p>
+        </div>
+        <form id="upload-form">
+          <label class="file-picker">
+            <input id="book-file" type="file" accept=".pdf,.epub,.txt" required />
+            <span>Выбрать книгу</span>
+          </label>
+          <button id="upload-button" type="submit">Индексировать</button>
+        </form>
+        <p id="upload-status" class="status" aria-live="polite"></p>
+      </section>
+
+      <section class="card" aria-labelledby="library-title">
+        <div class="section-heading">
+          <div>
+            <p class="section-label">3. ДОСТУПНЫЕ ИСТОЧНИКИ</p>
+            <h2 id="library-title">Библиотека</h2>
+          </div>
+          <button id="refresh-books" class="button-secondary" type="button">Обновить</button>
+        </div>
+        <div id="book-list" class="book-list"><p class="empty-state">Книги пока не загружены.</p></div>
+      </section>
+
+      <section class="card ask-card" aria-labelledby="question-title">
+        <p class="section-label">4. СПРОСИТЬ NBRAIN</p>
+        <h2 id="question-title">Ответ или сравнение книг с источниками</h2>
+        <form id="question-form">
+          <label for="analysis-mode">Режим</label>
+          <select id="analysis-mode">
+            <option value="reader">Reader — ответ по книге или библиотеке</option>
+            <option value="thinker">Thinker — сравнить несколько книг</option>
+            <option value="strategist">Strategist — план на 90 дней</option>
+          </select>
+          <label for="book-filter">Книги для анализа</label>
+          <div id="book-filter" class="book-picker" role="group" aria-describedby="books-help"></div>
+          <div class="book-filter-actions">
+            <button id="select-all-books" class="button-secondary" type="button">Выбрать все</button>
+            <button id="clear-book-selection" class="button-secondary" type="button">Очистить выбор</button>
+          </div>
+          <p id="books-help" class="field-help">Reader: не выбирайте книги для поиска по всей библиотеке. Thinker: выберите минимум две книги.</p>
+          <div class="prompt-chips" aria-label="Примеры вопросов">
+            <button type="button" data-prompt="Какие 3 идеи из выбранных книг стоит применить в ближайшие 7 дней?">3 действия на неделю</button>
+            <button type="button" data-prompt="Какие идеи из выбранных книг помогут развить системное мышление команды?">Системное мышление</button>
+            <button type="button" data-prompt="На основе выбранных книг и моего профиля создай стратегический план на 90 дней.">План на 90 дней</button>
+          </div>
+          <label for="question">Ваш вопрос</label>
+          <textarea id="question" rows="4" placeholder="Например: Какие идеи из этой книги помогут выбрать стратегический приоритет?" required></textarea>
+          <div class="form-actions">
+            <button id="answer-button" type="submit">Получить ответ</button>
+            <button id="search-button" class="button-secondary" type="button">Только найти фрагменты</button>
+          </div>
+        </form>
+        <p id="question-status" class="status" aria-live="polite"></p>
+      </section>
+
+      <section id="answer-panel" class="card result-card hidden" aria-labelledby="answer-title">
+        <p class="section-label">ОТВЕТ NBRAIN</p>
+        <h2 id="answer-title">Рекомендация</h2>
+        <div id="answer-text" class="answer-text"></div>
+        <div class="result-actions">
+          <button id="save-idea" class="button-secondary" type="button">Сохранить идею</button>
+          <button id="answer-to-action" type="button">Создать действие из ответа</button>
+        </div>
+        <div id="export-actions" class="export-actions hidden">
+          <span>Экспорт стратегического плана:</span>
+          <button id="export-docx" class="button-secondary" type="button">Скачать Word</button>
+          <button id="export-pdf" class="button-secondary" type="button">Скачать PDF</button>
+        </div>
+        <p id="answer-memory-status" class="status" aria-live="polite"></p>
+        <h3>Источники</h3>
+        <div id="source-list" class="source-list"></div>
+      </section>
+
+      <section class="card planning-card" aria-labelledby="actions-title">
+        <p class="section-label">5. ПАМЯТЬ И ДЕЙСТВИЯ</p>
+        <h2 id="actions-title">План внедрения</h2>
+        <form id="action-form" class="action-form">
+          <label for="action-title">Новое действие<input id="action-title" maxlength="300" placeholder="Например: провести сессию по стратегическим приоритетам" required /></label>
+          <label for="action-details">Контекст или ожидаемый результат<textarea id="action-details" rows="2" maxlength="4000" placeholder="Что должно получиться?"></textarea></label>
+          <div class="action-inputs">
+            <label for="action-date">Срок<input id="action-date" type="date" /></label>
+            <button id="action-save" type="submit">Добавить действие</button>
+          </div>
+        </form>
+        <p id="action-status" class="status" aria-live="polite"></p>
+        <div id="action-list" class="action-list"><p class="empty-state">Действий пока нет.</p></div>
+        <h3>Сохранённые идеи</h3>
+        <div id="memory-list" class="memory-list"><p class="empty-state">Сохранённых идей пока нет.</p></div>
+      </section>
+    </main>
+    <section id="auth-gate" class="auth-gate hidden" aria-labelledby="login-title">
+      <form id="login-form" class="login-card">
+        <span class="brand-mark">N</span>
+        <p class="section-label">ЧАСТНЫЙ ДОСТУП</p>
+        <h1 id="login-title">Вход в NBrain</h1>
+        <p>Введите личный пароль, чтобы открыть библиотеку и стратегическую память.</p>
+        <label for="login-password">Пароль<input id="login-password" type="password" autocomplete="current-password" required /></label>
+        <button id="login-button" type="submit">Войти</button>
+        <p id="login-status" class="status" aria-live="polite"></p>
+      </form>
+    </section>
+    <script src="/web/app.js"></script>
+  </body>
+</html>
