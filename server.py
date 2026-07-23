@@ -493,7 +493,10 @@ def memory_context() -> str:
     for action in actions:
         suffix = f" (срок: {action['due_date']})" if action["due_date"] else ""
         action_lines.append(f"- {action['title']}{suffix}")
-    memory_lines = [f"- {memory['kind']}: {re.sub(r'\s+', ' ', memory['content'])[:500]}" for memory in memories]
+    memory_lines = []
+    for memory in memories:
+        content = re.sub(r"\s+", " ", memory["content"])[:500]
+        memory_lines.append(f"- {memory['kind']}: {content}")
     return "\n".join(
         [
             "Открытые действия:\n" + ("\n".join(action_lines) or "нет"),
