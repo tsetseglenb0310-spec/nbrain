@@ -52,6 +52,29 @@ function hideAuthGate() {
   setStatus(loginStatus, '');
 }
 
+function setupWorkspaceNavigation() {
+  const links = Array.from(document.querySelectorAll('[data-section-link]'));
+  const sections = links
+    .map((link) => document.getElementById(link.dataset.sectionLink))
+    .filter(Boolean);
+  const setActive = (id) => {
+    links.forEach((link) => link.classList.toggle('is-active', link.dataset.sectionLink === id));
+  };
+  links.forEach((link) => link.addEventListener('click', () => {
+    if (link.dataset.sectionLink === 'profile-section') $('#profile-section').open = true;
+    setActive(link.dataset.sectionLink);
+  }));
+  if (!sections.length || !('IntersectionObserver' in window)) return;
+  const observer = new IntersectionObserver((entries) => {
+    const visible = entries
+      .filter((entry) => entry.isIntersecting)
+      .sort((left, right) => right.intersectionRatio - left.intersectionRatio)[0];
+    if (visible) setActive(visible.target.id);
+  }, { rootMargin: '-18% 0px -65% 0px', threshold: [0.05, 0.2, 0.45] });
+  sections.forEach((section) => observer.observe(section));
+  setActive(sections[0].id);
+}
+
 async function initializeApp() {
   try {
     const status = await api('/api/auth/status');
@@ -663,4 +686,5 @@ $('#question-form').addEventListener('submit', (event) => { event.preventDefault
 $('#search-button').addEventListener('click', () => findOrAnswer(false));
 $('#refresh-books').addEventListener('click', loadBooks);
 updateResponseFormat();
+setupWorkspaceNavigation();
 initializeApp();
