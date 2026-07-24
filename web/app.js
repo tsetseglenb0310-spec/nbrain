@@ -54,25 +54,28 @@ function hideAuthGate() {
 
 function setupWorkspaceNavigation() {
   const links = Array.from(document.querySelectorAll('[data-section-link]'));
-  const sections = links
-    .map((link) => document.getElementById(link.dataset.sectionLink))
-    .filter(Boolean);
-  const setActive = (id) => {
-    links.forEach((link) => link.classList.toggle('is-active', link.dataset.sectionLink === id));
+  const panels = Array.from(document.querySelectorAll('[data-workspace-panel]'));
+  const availableIds = new Set(panels.map((panel) => panel.dataset.workspacePanel));
+  const showSection = (id, writeHash = true) => {
+    if (!availableIds.has(id)) return;
+    panels.forEach((panel) => {
+      panel.classList.toggle('workspace-hidden', panel.dataset.workspacePanel !== id);
+    });
+    document.querySelectorAll('.workspace-nav [data-section-link]').forEach((link) => {
+      link.classList.toggle('is-active', link.dataset.sectionLink === id);
+    });
+    if (id === 'profile-section') $('#profile-section').open = true;
+    if (writeHash && window.location.hash !== `#${id}`) {
+      window.history.replaceState(null, '', `#${id}`);
+    }
   };
-  links.forEach((link) => link.addEventListener('click', () => {
-    if (link.dataset.sectionLink === 'profile-section') $('#profile-section').open = true;
-    setActive(link.dataset.sectionLink);
+  links.forEach((link) => link.addEventListener('click', (event) => {
+    event.preventDefault();
+    showSection(link.dataset.sectionLink);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
   }));
-  if (!sections.length || !('IntersectionObserver' in window)) return;
-  const observer = new IntersectionObserver((entries) => {
-    const visible = entries
-      .filter((entry) => entry.isIntersecting)
-      .sort((left, right) => right.intersectionRatio - left.intersectionRatio)[0];
-    if (visible) setActive(visible.target.id);
-  }, { rootMargin: '-18% 0px -65% 0px', threshold: [0.05, 0.2, 0.45] });
-  sections.forEach((section) => observer.observe(section));
-  setActive(sections[0].id);
+  const requestedId = window.location.hash.slice(1);
+  showSection(availableIds.has(requestedId) ? requestedId : 'analysis-section', false);
 }
 
 async function initializeApp() {

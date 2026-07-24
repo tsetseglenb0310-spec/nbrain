@@ -19,9 +19,9 @@
         <p class="subtitle">Исследуйте книги, формируйте решения и превращайте идеи в управленческие шаги.</p>
         <div class="focus-strip"><span>Текущий фокус</span><strong id="focus-summary">Загрузите профиль, чтобы задать фокус.</strong></div>
         <div class="hero-actions" aria-label="Быстрые действия">
-          <a href="#analysis-section">Задать вопрос</a>
-          <a href="#knowledge-section">Загрузить книгу</a>
-          <a href="#memory-section">Открыть план действий</a>
+          <a href="#analysis-section" data-section-link="analysis-section">Задать вопрос</a>
+          <a href="#knowledge-section" data-section-link="knowledge-section">Загрузить книгу</a>
+          <a href="#memory-section" data-section-link="memory-section">Открыть план действий</a>
         </div>
       </section>
 
@@ -33,7 +33,7 @@
         <a href="#memory-section" data-section-link="memory-section"><span>05</span>Память и действия</a>
       </nav>
 
-      <details id="profile-section" class="card profile-card workspace-section" aria-labelledby="profile-title">
+      <details id="profile-section" data-workspace-panel="profile-section" class="card profile-card workspace-section" aria-labelledby="profile-title">
         <summary>
           <div><p class="section-label">ПРОФИЛЬ</p><h2 id="profile-title">Профиль Мухамеда Чапанова</h2></div>
           <span class="summary-hint">Изменить</span>
@@ -53,7 +53,7 @@
         </div>
       </details>
 
-      <section id="development-section" class="card development-card workspace-section" aria-labelledby="development-title">
+      <section id="development-section" data-workspace-panel="development-section" class="card development-card workspace-section" aria-labelledby="development-title">
         <div class="section-heading">
           <div>
             <p class="section-label">ПЕРСОНАЛЬНАЯ ПРОГРАММА РАЗВИТИЯ</p>
@@ -95,7 +95,7 @@
         </div>
       </section>
 
-      <section id="knowledge-section" class="workspace-section workspace-group" aria-labelledby="upload-title">
+      <section id="knowledge-section" data-workspace-panel="knowledge-section" class="workspace-section workspace-group" aria-labelledby="upload-title">
       <section class="card upload-card" aria-labelledby="upload-title">
         <div>
           <p class="section-label">2. БИБЛИОТЕКА</p>
@@ -124,7 +124,7 @@
       </section>
       </section>
 
-      <section id="analysis-section" class="card ask-card workspace-section" aria-labelledby="question-title">
+      <section id="analysis-section" data-workspace-panel="analysis-section" class="card ask-card workspace-section" aria-labelledby="question-title">
         <p class="section-label">4. СПРОСИТЬ NBRAIN</p>
         <h2 id="question-title">Ответ или сравнение книг с источниками</h2>
         <form id="question-form">
@@ -163,7 +163,7 @@
         <p id="question-status" class="status" aria-live="polite"></p>
       </section>
 
-      <section id="answer-panel" class="card result-card hidden" aria-labelledby="answer-title">
+      <section id="answer-panel" data-workspace-panel="analysis-section" class="card result-card hidden" aria-labelledby="answer-title">
         <p class="section-label">ОТВЕТ NBRAIN</p>
         <h2 id="answer-title">Рекомендация</h2>
         <div id="answer-text" class="answer-text"></div>
@@ -181,7 +181,7 @@
         <div id="source-list" class="source-list"></div>
       </section>
 
-      <section id="memory-section" class="card planning-card workspace-section" aria-labelledby="actions-title">
+      <section id="memory-section" data-workspace-panel="memory-section" class="card planning-card workspace-section" aria-labelledby="actions-title">
         <p class="section-label">5. ПАМЯТЬ И ДЕЙСТВИЯ</p>
         <h2 id="actions-title">План внедрения</h2>
         <form id="action-form" class="action-form">
