@@ -2,6 +2,7 @@ const $ = (selector) => document.querySelector(selector);
 const bookList = $('#book-list');
 const bookFilter = $('#book-filter');
 const analysisMode = $('#analysis-mode');
+const responseDetail = $('#response-detail');
 const uploadStatus = $('#upload-status');
 const questionStatus = $('#question-status');
 const answerPanel = $('#answer-panel');
@@ -362,15 +363,30 @@ const modeDescriptions = {
   strategist: 'Strategist: выберите одну или несколько книг, чтобы создать план на 90 дней и скачать его в Word/PDF.',
 };
 
+function updateResponseFormat() {
+  const isReader = analysisMode.value === 'reader';
+  responseDetail.disabled = !isReader;
+  if (!isReader) responseDetail.value = 'standard';
+  $('#detail-help').textContent = isReader
+    ? 'Для подробного разбора выберите одну проиндексированную книгу. NBrain проанализирует её идеи, логику и практическое применение с источниками.'
+    : 'Подробный разбор доступен в режиме Reader. Для Thinker и Strategist NBrain использует их специализированную структуру ответа.';
+}
+
 analysisMode.addEventListener('change', () => {
   $('#books-help').textContent = modeDescriptions[analysisMode.value];
+  updateResponseFormat();
 });
 
 document.querySelectorAll('.prompt-chips button').forEach((button) => {
   button.addEventListener('click', () => {
     $('#question').value = button.dataset.prompt;
     if (button.dataset.prompt.includes('90 дней')) analysisMode.value = 'strategist';
+    if (button.dataset.detail) {
+      analysisMode.value = 'reader';
+      responseDetail.value = button.dataset.detail;
+    }
     $('#books-help').textContent = modeDescriptions[analysisMode.value];
+    updateResponseFormat();
     $('#question').focus();
   });
 });
@@ -380,7 +396,7 @@ function renderSources(sources) {
     <article id="source-${index + 1}" class="source-card">
       <div class="source-topline"><strong>[S${index + 1}] ${escapeHtml(source.title)}</strong><span>${formatPages(source)}</span></div>
       <p>${escapeHtml(source.content)}</p>
-      <small>Релевантность: ${Math.round(source.score * 100)}%</small>
+      <small>${source.source_kind === 'overview' ? 'Фрагмент для целостного охвата книги' : `Релевантность: ${Math.round(source.score * 100)}%`}</small>
     </article>
   `).join('');
 }
@@ -613,8 +629,13 @@ async function findOrAnswer(withAnswer) {
   if (!question) return;
   const bookIds = selectedBookIds();
   const mode = analysisMode.value;
+  const detail = responseDetail.value;
   if (withAnswer && mode === 'thinker' && bookIds.length < 2) {
     setStatus(questionStatus, 'Для режима Thinker выберите минимум две книги.', true);
+    return;
+  }
+  if (withAnswer && detail === 'deep' && mode === 'reader' && bookIds.length !== 1) {
+    setStatus(questionStatus, 'Для подробного разбора выберите ровно одну проиндексированную книгу.', true);
     return;
   }
   const button = withAnswer ? $('#answer-button') : $('#search-button');
@@ -622,9 +643,9 @@ async function findOrAnswer(withAnswer) {
   setStatus(questionStatus, withAnswer ? 'NBrain ищет источники и готовит ответ…' : 'NBrain ищет релевантные фрагменты…');
   try {
     if (withAnswer) {
-      const data = await api('/api/answer', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question, book_ids: bookIds, mode }) });
+      const data = await api('/api/answer', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question, book_ids: bookIds, mode, detail }) });
       renderResult(data.answer, data.sources);
-      $('#answer-title').textContent = mode === 'thinker' ? 'Синтез NBrain' : mode === 'strategist' ? 'Стратегический план' : 'Рекомендация';
+      $('#answer-title').textContent = detail === 'deep' && mode === 'reader' ? 'Подробный разбор книги' : mode === 'thinker' ? 'Синтез NBrain' : mode === 'strategist' ? 'Стратегический план' : 'Рекомендация';
       setStatus(questionStatus, `Найдено ${data.sources.length} источников.`);
     } else {
       const data = await api('/api/search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: question, book_ids: bookIds, limit: 8 }) });
@@ -641,4 +662,5 @@ async function findOrAnswer(withAnswer) {
 $('#question-form').addEventListener('submit', (event) => { event.preventDefault(); findOrAnswer(true); });
 $('#search-button').addEventListener('click', () => findOrAnswer(false));
 $('#refresh-books').addEventListener('click', loadBooks);
+updateResponseFormat();
 initializeApp();

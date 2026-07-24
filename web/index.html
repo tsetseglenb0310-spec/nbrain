@@ -119,6 +119,12 @@
             <option value="thinker">Thinker — сравнить несколько книг</option>
             <option value="strategist">Strategist — план на 90 дней</option>
           </select>
+          <label for="response-detail">Формат ответа</label>
+          <select id="response-detail">
+            <option value="standard">Управленческий ответ — кратко и по делу</option>
+            <option value="deep">Подробный разбор выбранной книги</option>
+          </select>
+          <p id="detail-help" class="field-help">Для подробного разбора выберите одну проиндексированную книгу. NBrain проанализирует её идеи, логику и практическое применение с источниками.</p>
           <label for="book-filter">Книги для анализа</label>
           <div id="book-filter" class="book-picker" role="group" aria-describedby="books-help"></div>
           <div class="book-filter-actions">
@@ -129,6 +135,7 @@
           <div class="prompt-chips" aria-label="Примеры вопросов">
             <button type="button" data-prompt="Какие 3 идеи из выбранных книг стоит применить в ближайшие 7 дней?">3 действия на неделю</button>
             <button type="button" data-prompt="Какие идеи из выбранных книг помогут развить системное мышление команды?">Системное мышление</button>
+            <button type="button" data-prompt="О чём эта книга? Дай подробный анализ: главная идея, логика автора, ключевые идеи, инструменты и применение для меня." data-detail="deep">Подробно разобрать книгу</button>
             <button type="button" data-prompt="На основе выбранных книг и моего профиля создай стратегический план на 90 дней.">План на 90 дней</button>
           </div>
           <label for="question">Ваш вопрос</label>
