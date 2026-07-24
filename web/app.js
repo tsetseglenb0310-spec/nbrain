@@ -60,6 +60,7 @@ async function initializeApp() {
     }
     hideAuthGate();
     await Promise.all([loadProfile(), loadBooks(), loadActions(), loadMemories()]);
+    await loadDevelopmentLibrary();
   } catch (error) {
     showAuthGate();
   }
@@ -81,6 +82,7 @@ $('#login-form').addEventListener('submit', async (event) => {
     $('#login-password').value = '';
     hideAuthGate();
     await Promise.all([loadProfile(), loadBooks(), loadActions(), loadMemories()]);
+    await loadDevelopmentLibrary();
   } catch (error) {
     setStatus(loginStatus, error.message, true);
   } finally {
@@ -138,6 +140,177 @@ async function loadBooks() {
   }
 }
 
+const developmentStatusLabels = {
+  planned: 'Планирую',
+  reading: 'Читаю',
+  read: 'Прочитал',
+  implemented: 'Внедряю',
+};
+let developmentSearchTimer;
+
+function optionHtml(value, label) {
+  return `<option value="${escapeHtml(value)}">${escapeHtml(label)}</option>`;
+}
+
+function renderDevelopmentSelects(filters) {
+  const strengthSelect = $('#development-strength');
+  const stageSelect = $('#development-stage');
+  const selectedStrength = strengthSelect.value;
+  const selectedStage = stageSelect.value;
+  strengthSelect.innerHTML = '<option value="">Все таланты</option>'
+    + (filters.strengths || []).map((strength) => optionHtml(strength, strength)).join('');
+  stageSelect.innerHTML = '<option value="">Все этапы</option>'
+    + (filters.stages || []).map((stage) => optionHtml(stage, `Этап ${stage}`)).join('');
+  strengthSelect.value = (filters.strengths || []).includes(selectedStrength) ? selectedStrength : '';
+  stageSelect.value = (filters.stages || []).includes(selectedStage) ? selectedStage : '';
+}
+
+function renderDevelopmentStats(summary) {
+  const statItems = [
+    ['В библиотеке', summary.total || 0],
+    ['Must Read', summary.must_read || 0],
+    ['Этап 1', summary.stage_1 || 0],
+    ['Читаю сейчас', summary.reading || 0],
+    ['Внедряю', summary.implemented || 0],
+  ];
+  $('#development-stats').innerHTML = statItems.map(([label, value]) => (
+    `<div class="development-stat"><strong>${value}</strong><span>${label}</span></div>`
+  )).join('');
+}
+
+function catalogBadges(book) {
+  const badges = [];
+  if (book.must_read) badges.push('<span class="catalog-badge must-read">Must Read</span>');
+  if (book.reading_stage) badges.push(`<span class="catalog-badge">Этап ${escapeHtml(book.reading_stage)}</span>`);
+  if (book.strength) badges.push(`<span class="catalog-badge strength-badge">${escapeHtml(book.strength)}</span>`);
+  return badges.join('');
+}
+
+function catalogStatusOptions(currentStatus) {
+  return Object.entries(developmentStatusLabels).map(([value, label]) => (
+    `<option value="${value}" ${currentStatus === value ? 'selected' : ''}>${label}</option>`
+  )).join('');
+}
+
+function renderDevelopmentCatalog(books, total) {
+  $('#development-count').textContent = total ? `${books.length} из ${total}` : '';
+  if (!books.length) {
+    $('#development-library-list').innerHTML = '<p class="empty-state">По этому фильтру книг не найдено.</p>';
+    return;
+  }
+  $('#development-library-list').innerHTML = books.map((book) => `
+    <article class="development-book">
+      <div class="development-book-topline">
+        <div><h4>${escapeHtml(book.title)}</h4><p>${escapeHtml([book.author, book.category].filter(Boolean).join(' · '))}</p></div>
+        <select class="catalog-status" data-development-id="${escapeHtml(book.id)}" aria-label="Статус чтения ${escapeHtml(book.title)}">${catalogStatusOptions(book.reading_status)}</select>
+      </div>
+      <div class="catalog-badges">${catalogBadges(book)}</div>
+      <p class="development-description">${escapeHtml(book.fit_reason || book.description || 'Рекомендация из личной программы развития.')}</p>
+      <div class="catalog-source ${book.has_uploaded_source ? 'ready' : ''}">${book.has_uploaded_source ? 'Текст загружен в RAG: можно задавать вопросы с источниками.' : 'Текст книги ещё не загружен: каталог помогает выбрать книгу, а RAG — изучать её содержание.'}</div>
+    </article>
+  `).join('');
+}
+
+function renderDevelopmentRecommendations(recommendations) {
+  if (!recommendations.length) {
+    $('#development-recommendations').innerHTML = '<p class="empty-state">Импортируйте Excel-библиотеку, чтобы увидеть персональный маршрут чтения.</p>';
+    return;
+  }
+  $('#development-recommendations').innerHTML = recommendations.map((book, index) => `
+    <article class="recommendation-card">
+      <span class="recommendation-number">${index + 1}</span>
+      <div>
+        <h4>${escapeHtml(book.title)}</h4>
+        <p class="recommendation-meta">${escapeHtml([book.author, book.strength, book.reading_stage ? `этап ${book.reading_stage}` : ''].filter(Boolean).join(' · '))}</p>
+        <p>${escapeHtml(book.recommendation_reason || book.fit_reason || book.description || '')}</p>
+        <div class="catalog-badges">${catalogBadges(book)}</div>
+      </div>
+    </article>
+  `).join('');
+}
+
+function developmentQuery() {
+  const parameters = new URLSearchParams();
+  const search = $('#development-search').value.trim();
+  if (search) parameters.set('q', search);
+  if ($('#development-strength').value) parameters.set('strength', $('#development-strength').value);
+  if ($('#development-stage').value) parameters.set('stage', $('#development-stage').value);
+  if ($('#development-status').value) parameters.set('status', $('#development-status').value);
+  if ($('#development-must-read').checked) parameters.set('must_read', 'true');
+  return parameters.toString();
+}
+
+async function loadDevelopmentLibrary() {
+  const list = $('#development-library-list');
+  try {
+    const query = developmentQuery();
+    const [library, recommendationResponse] = await Promise.all([
+      api(`/api/development-library${query ? `?${query}` : ''}`),
+      api('/api/development-library/recommendations'),
+    ]);
+    renderDevelopmentSelects(library.filters || {});
+    renderDevelopmentStats(library.summary || {});
+    renderDevelopmentCatalog(library.books || [], (library.summary || {}).total || 0);
+    renderDevelopmentRecommendations(recommendationResponse.recommendations || []);
+  } catch (error) {
+    list.innerHTML = `<p class="empty-state error">${escapeHtml(error.message)}</p>`;
+  }
+}
+
+$('#development-import-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const input = $('#development-library-file');
+  const file = input.files[0];
+  if (!file) {
+    setStatus($('#development-import-status'), 'Выберите файл Excel с библиотекой.', true);
+    return;
+  }
+  const button = $('#development-import-button');
+  button.disabled = true;
+  setStatus($('#development-import-status'), `Импортирую «${file.name}»…`);
+  try {
+    const result = await api('/api/development-library/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream', 'X-Filename': encodeURIComponent(file.name) },
+      body: file,
+    });
+    input.value = '';
+    setStatus($('#development-import-status'), `Готово: импортировано книг — ${result.books}, ресурсов — ${result.resources}.`);
+    await loadDevelopmentLibrary();
+  } catch (error) {
+    setStatus($('#development-import-status'), error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+['development-strength', 'development-stage', 'development-status', 'development-must-read'].forEach((id) => {
+  $("#" + id).addEventListener('change', loadDevelopmentLibrary);
+});
+
+$('#development-search').addEventListener('input', () => {
+  window.clearTimeout(developmentSearchTimer);
+  developmentSearchTimer = window.setTimeout(loadDevelopmentLibrary, 250);
+});
+
+$('#development-library-list').addEventListener('change', async (event) => {
+  const select = event.target.closest('select[data-development-id]');
+  if (!select) return;
+  select.disabled = true;
+  try {
+    await api('/api/development-library/status', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: select.dataset.developmentId, reading_status: select.value }),
+    });
+    await loadDevelopmentLibrary();
+  } catch (error) {
+    setStatus($('#development-import-status'), error.message, true);
+  } finally {
+    select.disabled = false;
+  }
+});
+
 function strengthsToText(strengths) {
   return Array.isArray(strengths) ? strengths.join(', ') : '';
 }
@@ -175,6 +348,7 @@ $('#profile-form').addEventListener('submit', async (event) => {
     $('#director-strengths').value = strengthsToText(profile.strengths);
     $('#focus-summary').textContent = profile.focus || 'Укажите фокус в профиле, чтобы получать персональные рекомендации.';
     setStatus(profileStatus, 'Профиль сохранён. Следующие ответы будут учитывать этот контекст.');
+    await loadDevelopmentLibrary();
   } catch (error) {
     setStatus(profileStatus, error.message, true);
   } finally {

@@ -31,12 +31,13 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree
 
 try:
     from pypdf import PdfReader
+    from openpyxl import load_workbook
 except ImportError as exc:  # pragma: no cover
     raise SystemExit("Install dependencies first: pip install -r requirements.txt") from exc
 
@@ -60,12 +61,26 @@ EMBEDDING_MODEL = os.environ.get("NBRAIN_EMBEDDING_MODEL", "text-embedding-3-sma
 CHUNK_WORDS = int(os.environ.get("NBRAIN_CHUNK_WORDS", "450"))
 CHUNK_OVERLAP = int(os.environ.get("NBRAIN_CHUNK_OVERLAP", "70"))
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+MAX_LIBRARY_IMPORT_BYTES = 8 * 1024 * 1024
 ALLOWED_EXTENSIONS = {".pdf", ".txt", ".epub"}
 DEFAULT_DIRECTOR_NAME = "Мухамед Чапанов"
 DEFAULT_STRENGTHS = [
     "Strategic", "Learner", "Achiever", "Ideation", "Analytical",
     "Futuristic", "Focus", "Arranger", "Individualization", "Belief",
 ]
+DEVELOPMENT_STATUSES = {"planned", "reading", "read", "implemented"}
+STRENGTH_ALIASES = {
+    "strategic": "Стратегия", "стратегия": "Стратегия",
+    "learner": "Ученик", "ученик": "Ученик",
+    "achiever": "Достижение", "достижение": "Достижение",
+    "ideation": "Генератор идей", "генератор идей": "Генератор идей",
+    "analytical": "Аналитик", "аналитик": "Аналитик",
+    "futuristic": "Будущее", "будущее": "Будущее",
+    "focus": "Сосредоточенность", "сосредоточенность": "Сосредоточенность",
+    "arranger": "Распорядитель", "распорядитель": "Распорядитель",
+    "individualization": "Индивидуализация", "индивидуализация": "Индивидуализация",
+    "belief": "Убеждение", "убеждение": "Убеждение",
+}
 
 
 class ClientError(Exception):
@@ -182,6 +197,39 @@ def init_storage() -> None:
                 completed_at TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_action_items_status_due ON action_items(status, due_date, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS development_books (
+                id TEXT PRIMARY KEY,
+                source_key TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL,
+                original_title TEXT NOT NULL DEFAULT '',
+                author TEXT NOT NULL DEFAULT '',
+                category TEXT NOT NULL DEFAULT '',
+                strength TEXT NOT NULL DEFAULT '',
+                level TEXT NOT NULL DEFAULT '',
+                practical_value INTEGER NOT NULL DEFAULT 0,
+                expected_impact INTEGER NOT NULL DEFAULT 0,
+                reading_stage INTEGER NOT NULL DEFAULT 3,
+                must_read INTEGER NOT NULL DEFAULT 0,
+                reading_status TEXT NOT NULL DEFAULT 'planned' CHECK (reading_status IN ('planned', 'reading', 'read', 'implemented')),
+                description TEXT NOT NULL DEFAULT '',
+                fit_reason TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_development_books_stage ON development_books(reading_stage, expected_impact DESC);
+            CREATE INDEX IF NOT EXISTS idx_development_books_strength ON development_books(strength);
+
+            CREATE TABLE IF NOT EXISTS development_resources (
+                strength TEXT PRIMARY KEY,
+                courses TEXT NOT NULL DEFAULT '',
+                authors TEXT NOT NULL DEFAULT '',
+                ted TEXT NOT NULL DEFAULT '',
+                podcasts TEXT NOT NULL DEFAULT '',
+                youtube TEXT NOT NULL DEFAULT '',
+                research TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL
+            );
             """
         )
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(chunks)")}
@@ -377,6 +425,283 @@ def list_books() -> list[dict[str, Any]]:
     with db() as conn:
         rows = conn.execute(
             "SELECT id, filename, title, extension, page_count, chunk_count, status, error, created_at FROM books ORDER BY created_at DESC"
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def normalize_catalog_text(value: Any) -> str:
+    return re.sub(r"[^a-zа-яё0-9]+", " ", str(value or "").casefold()).strip()
+
+
+def catalog_source_key(title: str, author: str) -> str:
+    return f"{normalize_catalog_text(title)}|{normalize_catalog_text(author)}"
+
+
+def canonical_strength(value: Any) -> str:
+    raw = str(value or "").split("(", 1)[0].strip()
+    return STRENGTH_ALIASES.get(raw.casefold(), raw)
+
+
+def catalog_status_from_excel(value: Any) -> str:
+    status = normalize_catalog_text(value)
+    if "внедр" in status:
+        return "implemented"
+    if "проч" in status:
+        return "read"
+    if "чита" in status:
+        return "reading"
+    return "planned"
+
+
+def catalog_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def catalog_yes(value: Any) -> int:
+    return int(normalize_catalog_text(value) in {"да", "yes", "true", "1"})
+
+
+def parse_development_library_xlsx(raw: bytes) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    try:
+        workbook = load_workbook(BytesIO(raw), data_only=True, read_only=True)
+    except Exception as exc:
+        raise ClientError("Не удалось открыть Excel-файл библиотеки развития.") from exc
+    if "Библиотека" not in workbook.sheetnames:
+        raise ClientError("В Excel не найден лист «Библиотека».")
+
+    books: list[dict[str, Any]] = []
+    for row in workbook["Библиотека"].iter_rows(min_row=3, values_only=True):
+        values = list(row) + [None] * 14
+        title = str(values[1] or "").strip()
+        if not title:
+            continue
+        author = str(values[3] or "").strip()
+        books.append(
+            {
+                "source_key": catalog_source_key(title, author),
+                "title": title,
+                "original_title": str(values[2] or "").strip(),
+                "author": author,
+                "category": str(values[4] or "").strip(),
+                "strength": canonical_strength(values[5]),
+                "level": str(values[6] or "").strip(),
+                "practical_value": max(0, min(10, catalog_int(values[7]))),
+                "expected_impact": max(0, min(10, catalog_int(values[8]))),
+                "reading_stage": max(1, min(9, catalog_int(values[9], 3))),
+                "must_read": catalog_yes(values[10]),
+                "reading_status": catalog_status_from_excel(values[11]),
+                "description": str(values[12] or "").strip()[:6000],
+                "fit_reason": str(values[13] or "").strip()[:6000],
+            }
+        )
+    if not books:
+        raise ClientError("На листе «Библиотека» не найдены карточки книг.")
+
+    resources: list[dict[str, str]] = []
+    if "Ресурсы" in workbook.sheetnames:
+        for row in workbook["Ресурсы"].iter_rows(min_row=3, values_only=True):
+            values = list(row) + [None] * 8
+            strength = canonical_strength(values[1])
+            if strength:
+                resources.append(
+                    {
+                        "strength": strength,
+                        "courses": str(values[2] or "").strip()[:6000],
+                        "authors": str(values[3] or "").strip()[:4000],
+                        "ted": str(values[4] or "").strip()[:6000],
+                        "podcasts": str(values[5] or "").strip()[:4000],
+                        "youtube": str(values[6] or "").strip()[:4000],
+                        "research": str(values[7] or "").strip()[:6000],
+                    }
+                )
+    return books, resources
+
+
+def import_development_library(raw: bytes) -> dict[str, int]:
+    books, resources = parse_development_library_xlsx(raw)
+    timestamp = now_iso()
+    with db() as conn:
+        for book in books:
+            conn.execute(
+                """
+                INSERT INTO development_books (
+                    id, source_key, title, original_title, author, category, strength, level,
+                    practical_value, expected_impact, reading_stage, must_read, reading_status,
+                    description, fit_reason, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_key) DO UPDATE SET
+                    title = excluded.title, original_title = excluded.original_title,
+                    author = excluded.author, category = excluded.category,
+                    strength = excluded.strength, level = excluded.level,
+                    practical_value = excluded.practical_value, expected_impact = excluded.expected_impact,
+                    reading_stage = excluded.reading_stage, must_read = excluded.must_read,
+                    description = excluded.description, fit_reason = excluded.fit_reason,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    str(uuid.uuid4()), book["source_key"], book["title"], book["original_title"], book["author"],
+                    book["category"], book["strength"], book["level"], book["practical_value"],
+                    book["expected_impact"], book["reading_stage"], book["must_read"], book["reading_status"],
+                    book["description"], book["fit_reason"], timestamp, timestamp,
+                ),
+            )
+        for resource in resources:
+            conn.execute(
+                """
+                INSERT INTO development_resources (strength, courses, authors, ted, podcasts, youtube, research, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(strength) DO UPDATE SET
+                    courses = excluded.courses, authors = excluded.authors, ted = excluded.ted,
+                    podcasts = excluded.podcasts, youtube = excluded.youtube, research = excluded.research,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    resource["strength"], resource["courses"], resource["authors"], resource["ted"],
+                    resource["podcasts"], resource["youtube"], resource["research"], timestamp,
+                ),
+            )
+    return {"books": len(books), "resources": len(resources)}
+
+
+def development_uploaded_titles() -> list[str]:
+    with db() as conn:
+        rows = conn.execute("SELECT title FROM books WHERE status = 'ready'").fetchall()
+    return [normalize_catalog_text(row["title"]) for row in rows]
+
+
+def catalog_has_uploaded_source(title: str, uploaded_titles: list[str]) -> bool:
+    candidate = normalize_catalog_text(title)
+    if len(candidate) < 4:
+        return False
+    return any(candidate in uploaded or uploaded in candidate for uploaded in uploaded_titles if len(uploaded) >= 4)
+
+
+def development_book_payload(row: sqlite3.Row, uploaded_titles: list[str]) -> dict[str, Any]:
+    book = dict(row)
+    book["must_read"] = bool(book["must_read"])
+    book["has_uploaded_source"] = catalog_has_uploaded_source(book["title"], uploaded_titles)
+    return book
+
+
+def development_library(query: dict[str, str] | None = None) -> dict[str, Any]:
+    query = query or {}
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT id, title, original_title, author, category, strength, level,
+                      practical_value, expected_impact, reading_stage, must_read, reading_status,
+                      description, fit_reason
+               FROM development_books
+               ORDER BY reading_stage, must_read DESC, expected_impact DESC, practical_value DESC, title"""
+        ).fetchall()
+    strength = str(query.get("strength", "")).strip()
+    status = str(query.get("status", "")).strip()
+    stage = str(query.get("stage", "")).strip()
+    must_read = str(query.get("must_read", "")).strip()
+    text_query = normalize_catalog_text(query.get("q", ""))
+    filtered: list[sqlite3.Row] = []
+    for row in rows:
+        if strength and row["strength"] != strength:
+            continue
+        if status and row["reading_status"] != status:
+            continue
+        if stage and str(row["reading_stage"]) != stage:
+            continue
+        if must_read.lower() in {"1", "true", "yes"} and not row["must_read"]:
+            continue
+        searchable = normalize_catalog_text(" ".join(str(row[key] or "") for key in ("title", "author", "category", "strength", "description")))
+        if text_query and text_query not in searchable:
+            continue
+        filtered.append(row)
+    uploaded_titles = development_uploaded_titles()
+    books = [development_book_payload(row, uploaded_titles) for row in filtered]
+    return {
+        "books": books,
+        "summary": {
+            "total": len(rows),
+            "must_read": sum(1 for row in rows if row["must_read"]),
+            "stage_1": sum(1 for row in rows if row["reading_stage"] == 1),
+            "reading": sum(1 for row in rows if row["reading_status"] == "reading"),
+            "implemented": sum(1 for row in rows if row["reading_status"] == "implemented"),
+        },
+        "filters": {
+            "strengths": sorted({str(row["strength"]) for row in rows if row["strength"]}),
+            "stages": sorted({int(row["reading_stage"]) for row in rows}),
+        },
+    }
+
+
+def development_recommendations(limit: int = 4) -> list[dict[str, Any]]:
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT id, title, original_title, author, category, strength, level,
+                      practical_value, expected_impact, reading_stage, must_read, reading_status,
+                      description, fit_reason
+               FROM development_books
+               WHERE reading_status IN ('planned', 'reading')
+               ORDER BY reading_stage, expected_impact DESC, practical_value DESC"""
+        ).fetchall()
+    profile = get_profile()
+    profile_strengths = {canonical_strength(item) for item in profile.get("strengths", [])}
+    focus_terms = [term for term in normalize_catalog_text(profile.get("focus", "")).split() if len(term) >= 4]
+    uploaded_titles = development_uploaded_titles()
+    scored: list[tuple[int, sqlite3.Row, list[str]]] = []
+    for row in rows:
+        score = int(row["expected_impact"]) * 10 + int(row["practical_value"]) * 4
+        reasons: list[str] = []
+        if row["strength"] in profile_strengths:
+            score += 28
+            reasons.append(f"усиливает ваш талант «{row['strength']}»")
+        if row["must_read"]:
+            score += 16
+            reasons.append("отмечена Must Read")
+        if row["reading_stage"] == 1:
+            score += 12
+            reasons.append("входит в Этап 1")
+        focus_text = normalize_catalog_text(" ".join(str(row[key] or "") for key in ("title", "category", "description", "fit_reason")))
+        matches = [term for term in focus_terms if term in focus_text]
+        if matches:
+            score += 8 * len(matches)
+            reasons.append("связана с текущим фокусом")
+        if not reasons:
+            reasons.append("имеет высокий ожидаемый эффект")
+        scored.append((score, row, reasons))
+    scored.sort(key=lambda item: (-item[0], item[1]["reading_stage"], item[1]["title"]))
+    recommendations = []
+    for _, row, reasons in scored[:max(1, min(limit, 10))]:
+        book = development_book_payload(row, uploaded_titles)
+        book["recommendation_reason"] = "; ".join(reasons)
+        recommendations.append(book)
+    return recommendations
+
+
+def update_development_status(payload: dict[str, Any]) -> dict[str, Any]:
+    book_id = str(payload.get("id", "")).strip()
+    status = str(payload.get("reading_status", "")).strip()
+    if not book_id or status not in DEVELOPMENT_STATUSES:
+        raise ClientError("Укажите книгу и корректный статус чтения.")
+    with db() as conn:
+        updated = conn.execute(
+            "UPDATE development_books SET reading_status = ?, updated_at = ? WHERE id = ?",
+            (status, now_iso(), book_id),
+        ).rowcount
+        row = conn.execute(
+            """SELECT id, title, original_title, author, category, strength, level,
+                      practical_value, expected_impact, reading_stage, must_read, reading_status,
+                      description, fit_reason FROM development_books WHERE id = ?""",
+            (book_id,),
+        ).fetchone()
+    if not updated or not row:
+        raise ClientError("Карточка книги не найдена.")
+    return development_book_payload(row, development_uploaded_titles())
+
+
+def development_resources() -> list[dict[str, Any]]:
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT strength, courses, authors, ted, podcasts, youtube, research FROM development_resources ORDER BY strength"
         ).fetchall()
     return [dict(row) for row in rows]
 
@@ -822,6 +1147,19 @@ class AppHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/books":
             self.json_response(HTTPStatus.OK, {"books": list_books()})
             return
+        if parsed.path == "/api/development-library":
+            raw_query = parse_qs(parsed.query)
+            query = {key: values[-1] for key, values in raw_query.items() if values}
+            self.json_response(HTTPStatus.OK, development_library(query))
+            return
+        if parsed.path == "/api/development-library/recommendations":
+            raw_query = parse_qs(parsed.query)
+            limit = catalog_int((raw_query.get("limit") or [4])[-1], 4)
+            self.json_response(HTTPStatus.OK, {"recommendations": development_recommendations(limit)})
+            return
+        if parsed.path == "/api/development-library/resources":
+            self.json_response(HTTPStatus.OK, {"resources": development_resources()})
+            return
         if parsed.path == "/api/profile":
             self.json_response(HTTPStatus.OK, {"profile": get_profile()})
             return
@@ -859,6 +1197,12 @@ class AppHandler(SimpleHTTPRequestHandler):
                 return
             if self.path == "/api/books":
                 self.upload_book()
+                return
+            if self.path == "/api/development-library/import":
+                self.import_development_library()
+                return
+            if self.path == "/api/development-library/status":
+                self.json_response(HTTPStatus.OK, {"book": update_development_status(self.read_json())})
                 return
             if self.path == "/api/profile":
                 self.json_response(HTTPStatus.OK, {"profile": save_profile(self.read_json())})
@@ -939,6 +1283,17 @@ class AppHandler(SimpleHTTPRequestHandler):
             with db() as conn:
                 conn.execute("UPDATE books SET status = 'failed', error = ? WHERE id = ?", (str(error), book_id))
             raise ClientError(f"Не удалось проиндексировать книгу: {error}") from error
+
+
+    def import_development_library(self) -> None:
+        length = int(self.headers.get("Content-Length", "0"))
+        if not 0 < length <= MAX_LIBRARY_IMPORT_BYTES:
+            raise ClientError("Размер Excel-файла должен быть не больше 8 МБ.")
+        filename = clean_filename(unquote(self.headers.get("X-Filename", "library.xlsx")))
+        if Path(filename).suffix.lower() != ".xlsx":
+            raise ClientError("Для импорта библиотеки нужен файл Excel в формате .xlsx.")
+        report = import_development_library(self.rfile.read(length))
+        self.json_response(HTTPStatus.CREATED, report)
 
 
 def main() -> None:

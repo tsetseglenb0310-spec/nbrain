@@ -40,6 +40,48 @@
         </div>
       </details>
 
+      <section class="card development-card" aria-labelledby="development-title">
+        <div class="section-heading">
+          <div>
+            <p class="section-label">ПЕРСОНАЛЬНАЯ ПРОГРАММА РАЗВИТИЯ</p>
+            <h2 id="development-title">Библиотека CliftonStrengths</h2>
+            <p class="development-intro">Каталог рекомендаций отделён от загруженных в RAG книг. Сначала выберите, что читать и внедрять; затем загрузите текст книги, чтобы получать ответы с цитатами.</p>
+          </div>
+          <form id="development-import-form" class="development-import-form">
+            <label class="file-picker compact-picker">
+              <input id="development-library-file" type="file" accept=".xlsx" />
+              <span>Импортировать Excel</span>
+            </label>
+            <button id="development-import-button" class="button-secondary" type="submit">Загрузить каталог</button>
+          </form>
+        </div>
+        <p id="development-import-status" class="status" aria-live="polite"></p>
+        <div id="development-stats" class="development-stats"></div>
+        <div class="development-filters" aria-label="Фильтры библиотеки развития">
+          <input id="development-search" type="search" placeholder="Найти книгу, тему или автора" />
+          <select id="development-strength"><option value="">Все таланты</option></select>
+          <select id="development-stage"><option value="">Все этапы</option></select>
+          <select id="development-status">
+            <option value="">Все статусы</option>
+            <option value="planned">Планирую</option>
+            <option value="reading">Читаю</option>
+            <option value="read">Прочитал</option>
+            <option value="implemented">Внедряю</option>
+          </select>
+          <label class="filter-check"><input id="development-must-read" type="checkbox" /> Только Must Read</label>
+        </div>
+        <div class="development-layout">
+          <div>
+            <div class="subsection-heading"><h3>Рекомендовано сейчас</h3><span>На основе профиля и текущего фокуса</span></div>
+            <div id="development-recommendations" class="recommendation-list"><p class="empty-state">Импортируйте Excel-библиотеку, чтобы получить персональные рекомендации.</p></div>
+          </div>
+          <div>
+            <div class="subsection-heading"><h3>Каталог развития</h3><span id="development-count"></span></div>
+            <div id="development-library-list" class="development-library-list"><p class="empty-state">Каталог пока не импортирован.</p></div>
+          </div>
+        </div>
+      </section>
+
       <section class="card upload-card" aria-labelledby="upload-title">
         <div>
           <p class="section-label">2. БИБЛИОТЕКА</p>
