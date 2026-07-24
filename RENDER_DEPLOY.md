@@ -39,6 +39,7 @@
 | Переменная | Значение |
 |---|---|
 | `OPENAI_API_KEY` | ваш новый действующий ключ OpenAI |
+| `ANTHROPIC_API_KEY` | необязательно: ключ Anthropic API для режима Claude |
 | `NBRAIN_AUTH_REQUIRED` | `1` |
 | `NBRAIN_ADMIN_PASSWORD` | отдельный длинный пароль для входа в NBrain |
 | `NBRAIN_SESSION_SECRET` | длинная случайная строка, не менее 32 символов |

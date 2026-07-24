@@ -139,6 +139,12 @@
             <option value="standard">Управленческий ответ — кратко и по делу</option>
             <option value="deep">Подробный разбор выбранной книги</option>
           </select>
+          <label for="answer-provider">Модель для ответа</label>
+          <select id="answer-provider">
+            <option value="openai">GPT — быстрый ответ</option>
+            <option value="claude">Claude — глубокий анализ книги и стратегии</option>
+          </select>
+          <p class="field-help">Claude использует те же найденные фрагменты и ссылки [S], но даёт более развёрнутый разбор. Для работы нужен ключ Anthropic API.</p>
           <p id="detail-help" class="field-help">Для подробного разбора выберите одну проиндексированную книгу. NBrain проанализирует её идеи, логику и практическое применение с источниками.</p>
           <label for="book-filter">Книги для анализа</label>
           <div id="book-filter" class="book-picker" role="group" aria-describedby="books-help"></div>

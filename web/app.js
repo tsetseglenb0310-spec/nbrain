@@ -3,6 +3,7 @@ const bookList = $('#book-list');
 const bookFilter = $('#book-filter');
 const analysisMode = $('#analysis-mode');
 const responseDetail = $('#response-detail');
+const answerProvider = $('#answer-provider');
 const uploadStatus = $('#upload-status');
 const questionStatus = $('#question-status');
 const answerPanel = $('#answer-panel');
@@ -656,6 +657,7 @@ async function findOrAnswer(withAnswer) {
   const bookIds = selectedBookIds();
   const mode = analysisMode.value;
   const detail = responseDetail.value;
+  const provider = answerProvider.value;
   if (withAnswer && mode === 'thinker' && bookIds.length < 2) {
     setStatus(questionStatus, 'Для режима Thinker выберите минимум две книги.', true);
     return;
@@ -669,7 +671,7 @@ async function findOrAnswer(withAnswer) {
   setStatus(questionStatus, withAnswer ? 'NBrain ищет источники и готовит ответ…' : 'NBrain ищет релевантные фрагменты…');
   try {
     if (withAnswer) {
-      const data = await api('/api/answer', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question, book_ids: bookIds, mode, detail }) });
+      const data = await api('/api/answer', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question, book_ids: bookIds, mode, detail, provider }) });
       renderResult(data.answer, data.sources);
       $('#answer-title').textContent = detail === 'deep' && mode === 'reader' ? 'Подробный разбор книги' : mode === 'thinker' ? 'Синтез NBrain' : mode === 'strategist' ? 'Стратегический план' : 'Рекомендация';
       setStatus(questionStatus, `Найдено ${data.sources.length} источников.`);

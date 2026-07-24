@@ -52,11 +52,13 @@ HOST = os.environ.get("NBRAIN_HOST", "127.0.0.1")
 # NBRAIN_PORT remains available for local development and Docker Compose.
 PORT = int(os.environ.get("PORT", os.environ.get("NBRAIN_PORT", "8000")))
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 AUTH_REQUIRED = os.environ.get("NBRAIN_AUTH_REQUIRED", "0") == "1"
 ADMIN_PASSWORD = os.environ.get("NBRAIN_ADMIN_PASSWORD", "")
 SESSION_SECRET = os.environ.get("NBRAIN_SESSION_SECRET", "")
 SECURE_COOKIES = os.environ.get("NBRAIN_SECURE_COOKIES", "0") == "1"
 ANSWER_MODEL = os.environ.get("NBRAIN_MODEL", "gpt-4o-mini")
+CLAUDE_MODEL = os.environ.get("NBRAIN_CLAUDE_MODEL", "claude-sonnet-4-6")
 EMBEDDING_MODEL = os.environ.get("NBRAIN_EMBEDDING_MODEL", "text-embedding-3-small")
 CHUNK_WORDS = int(os.environ.get("NBRAIN_CHUNK_WORDS", "450"))
 CHUNK_OVERLAP = int(os.environ.get("NBRAIN_CHUNK_OVERLAP", "70"))
@@ -365,6 +367,46 @@ def openai_request(path: str, payload: dict[str, Any]) -> dict[str, Any]:
         raise ClientError(f"OpenAI API вернул ошибку {error.code}: {detail}") from error
     except URLError as error:
         raise ClientError(f"Не удалось подключиться к OpenAI API: {error.reason}") from error
+
+
+def claude_request(instructions: str, prompt: str, max_tokens: int) -> str:
+    """Ask Claude through Anthropic's Messages API for a grounded final answer."""
+    if not ANTHROPIC_API_KEY:
+        raise ClientError("Claude пока не подключён. Добавьте ANTHROPIC_API_KEY в переменные окружения Render.")
+    request = Request(
+        "https://api.anthropic.com/v1/messages",
+        data=json.dumps(
+            {
+                "model": CLAUDE_MODEL,
+                "max_tokens": max_tokens,
+                "system": instructions,
+                "messages": [{"role": "user", "content": prompt}],
+            }
+        ).encode("utf-8"),
+        method="POST",
+        headers={
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urlopen(request, timeout=180) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")
+        raise ClientError(f"Claude API вернул ошибку {error.code}: {detail}") from error
+    except URLError as error:
+        raise ClientError(f"Не удалось подключиться к Claude API: {error.reason}") from error
+
+    answer = "".join(
+        str(item.get("text", ""))
+        for item in payload.get("content", [])
+        if item.get("type") == "text"
+    ).strip()
+    if not answer:
+        raise ClientError("Claude вернул пустой ответ. Попробуйте ещё раз.")
+    return answer
 
 
 def embed_many(texts: list[str], *, query: bool = False) -> list[list[float]]:
@@ -1056,7 +1098,13 @@ def create_pdf_export(question: str, answer: str, sources: list[dict[str, Any]])
     return buffer.getvalue()
 
 
-def answer_question(question: str, sources: list[dict[str, Any]], mode: str = "reader", detail: str = "standard") -> str:
+def answer_question(
+    question: str,
+    sources: list[dict[str, Any]],
+    mode: str = "reader",
+    detail: str = "standard",
+    provider: str = "openai",
+) -> str:
     profile = get_profile()
     saved_context = memory_context()
     context = "\n\n".join(
@@ -1134,10 +1182,14 @@ def answer_question(question: str, sources: list[dict[str, Any]], mode: str = "r
 **Метрики успеха**
 **Первый шаг на этой неделе**
 Не выдумывай факты о компании. Если данных о текущей ситуации недостаточно, явно обозначь допущения и предложи, какие данные уточнить. Каждое утверждение, взятое из книги, подтверждай [S]."""
+    prompt = f"Профиль директора:\n{profile_context}\n\nПамять NBrain:\n{saved_context}\n\nВопрос директора: {question}\n\nДоступные источники:\n{context}"
+    if provider == "claude":
+        return claude_request(instructions, prompt, 3200 if detail == "deep" else 1400)
+
     payload = {
         "model": ANSWER_MODEL,
         "instructions": instructions,
-        "input": f"Профиль директора:\n{profile_context}\n\nПамять NBrain:\n{saved_context}\n\nВопрос директора: {question}\n\nДоступные источники:\n{context}",
+        "input": prompt,
     }
     if detail == "deep":
         payload["max_output_tokens"] = 2400
@@ -1196,7 +1248,7 @@ class AppHandler(SimpleHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         if parsed.path == "/api/health":
-            self.json_response(HTTPStatus.OK, {"ok": True, "api_key_configured": bool(OPENAI_API_KEY), "provider": "openai", "embedding_model": EMBEDDING_MODEL})
+            self.json_response(HTTPStatus.OK, {"ok": True, "api_key_configured": bool(OPENAI_API_KEY), "provider": "openai", "embedding_model": EMBEDDING_MODEL, "claude_configured": bool(ANTHROPIC_API_KEY), "claude_model": CLAUDE_MODEL})
             return
         if parsed.path == "/api/auth/status":
             self.json_response(HTTPStatus.OK, {"auth_required": AUTH_REQUIRED, "authenticated": session_is_valid(self.headers.get("Cookie", ""))})
@@ -1289,17 +1341,20 @@ class AppHandler(SimpleHTTPRequestHandler):
                 question = str(body.get("question", "")).strip()
                 mode = str(body.get("mode", "reader")).strip().lower()
                 detail = str(body.get("detail", "standard")).strip().lower()
+                provider = str(body.get("provider", "openai")).strip().lower()
                 if mode not in {"reader", "thinker", "strategist"}:
                     raise ClientError("Поддерживаются режимы reader, thinker и strategist.")
                 if detail not in {"standard", "deep"}:
                     raise ClientError("Поддерживаются форматы ответа standard и deep.")
+                if provider not in {"openai", "claude"}:
+                    raise ClientError("Поддерживаются модели OpenAI и Claude.")
                 book_ids = body.get("book_ids") or ([body["book_id"]] if body.get("book_id") else [])
                 if not isinstance(book_ids, list):
                     raise ClientError("Книги должны быть переданы списком.")
                 if mode == "thinker" and len(book_ids) < 2:
                     raise ClientError("Для режима Thinker выберите минимум две книги.")
                 sources = sources_for_answer(question, mode, book_ids, detail)
-                self.json_response(HTTPStatus.OK, {"answer": answer_question(question, sources, mode, detail), "sources": sources, "mode": mode, "detail": detail})
+                self.json_response(HTTPStatus.OK, {"answer": answer_question(question, sources, mode, detail, provider), "sources": sources, "mode": mode, "detail": detail, "provider": provider})
                 return
             if self.path == "/api/export/docx":
                 question, answer, sources = export_data(self.read_json())
