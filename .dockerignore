@@ -1,0 +1,29 @@
+# Dockerfile does `COPY . ./`, so anything not listed here ends up inside the
+# image. .gitignore does not apply to the Docker build context.
+
+# Secrets. The local .env holds the real API keys and admin password; the
+# container gets its values from the platform (Render dashboard, compose
+# `environment:`), never from a file baked into the layer.
+.env
+.env.*
+!.env.example
+
+# The working database, uploaded books and their vectors. Mounted as a volume
+# at runtime; copying it in would ship the director's library to the registry.
+data/
+
+# History with every past version of the files above.
+.git/
+.gitignore
+
+# Not needed at runtime.
+tests/
+__pycache__/
+**/__pycache__/
+*.pyc
+.vendor/
+*.md
+!README.md
+Dockerfile
+.dockerignore
+docker-compose.yml

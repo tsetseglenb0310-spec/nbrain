@@ -6,12 +6,35 @@ services:
     environment:
       OPENAI_API_KEY: ${OPENAI_API_KEY:?Set OPENAI_API_KEY in .env}
       NBRAIN_AUTH_REQUIRED: "1"
+      NBRAIN_ADMIN_USERNAME: ${NBRAIN_ADMIN_USERNAME:-admin}
       NBRAIN_ADMIN_PASSWORD: ${NBRAIN_ADMIN_PASSWORD:?Set NBRAIN_ADMIN_PASSWORD in .env}
       NBRAIN_SESSION_SECRET: ${NBRAIN_SESSION_SECRET:?Set NBRAIN_SESSION_SECRET in .env}
       NBRAIN_SECURE_COOKIES: ${NBRAIN_SECURE_COOKIES:-0}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      NBRAIN_PUBLIC_URL: ${NBRAIN_PUBLIC_URL:-}
+      NBRAIN_SMTP_HOST: ${NBRAIN_SMTP_HOST:-}
+      NBRAIN_SMTP_PORT: ${NBRAIN_SMTP_PORT:-587}
+      NBRAIN_SMTP_USER: ${NBRAIN_SMTP_USER:-}
+      NBRAIN_SMTP_PASSWORD: ${NBRAIN_SMTP_PASSWORD:-}
+      NBRAIN_SMTP_FROM: ${NBRAIN_SMTP_FROM:-}
+      NBRAIN_SMTP_SECURITY: ${NBRAIN_SMTP_SECURITY:-starttls}
+      NBRAIN_REGISTRATION_OPEN: ${NBRAIN_REGISTRATION_OPEN:-1}
+      # Behind your own nginx, replace this with NBRAIN_TRUSTED_PROXIES.
+      NBRAIN_TRUST_FORWARDED_FOR: ${NBRAIN_TRUST_FORWARDED_FOR:-0}
+      NBRAIN_INDEX_WORKERS: ${NBRAIN_INDEX_WORKERS:-2}
     volumes:
       - nbrain_data:/app/data
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/api/health',timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    # Indexing keeps whole chunk sets and their vectors in memory; a bound stops
+    # a burst of uploads from taking the host down with it.
+    mem_limit: 2g
+    stop_grace_period: 30s
 
 volumes:
   nbrain_data:

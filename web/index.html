@@ -4,14 +4,24 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>NBrain MVP</title>
+    <link rel="icon" href="data:," />
     <link rel="stylesheet" href="/web/styles.css" />
   </head>
   <body>
     <main class="app-shell">
       <header class="topbar">
         <div class="brand"><span class="brand-mark">N</span><span>NBrain <small>AI Director Advisor</small></span></div>
-        <span class="secure-badge">Личная база знаний</span>
+        <div class="account-strip">
+          <span class="secure-badge">Личная база знаний</span>
+          <span id="current-user" class="user-chip hidden" aria-live="polite"></span>
+          <button id="logout-button" class="button-secondary hidden" type="button">Выйти</button>
+        </div>
       </header>
+
+      <div id="verify-banner" class="notice-banner hidden">
+        <p>Адрес почты не подтверждён. Без подтверждения нельзя восстановить пароль самостоятельно.</p>
+        <button type="button" id="resend-verify" class="button-secondary">Прислать письмо ещё раз</button>
+      </div>
 
       <section class="hero-card" aria-labelledby="hero-title">
         <p class="eyebrow">СТРАТЕГИЧЕСКАЯ СИСТЕМА ЗНАНИЙ</p>
@@ -50,6 +60,50 @@
           <div class="form-actions"><button id="profile-save" type="submit">Сохранить профиль</button></div>
         </form>
         <p id="profile-status" class="status" aria-live="polite"></p>
+
+        <div class="account-panel">
+          <h3>Аккаунт</h3>
+          <form id="password-form" class="profile-form">
+            <div class="profile-grid">
+              <label for="current-password">Текущий пароль<input id="current-password" type="password" autocomplete="current-password" required /></label>
+              <label for="new-password">Новый пароль<input id="new-password" type="password" autocomplete="new-password" minlength="8" required /></label>
+            </div>
+            <div class="form-actions"><button class="button-secondary" type="submit">Сменить пароль</button></div>
+          </form>
+          <p id="password-status" class="status" aria-live="polite"></p>
+
+          <h3>Ваши данные</h3>
+          <p class="field-help">Экспорт выгружает всё, что NBrain сохранил о вас, одним файлом JSON. Удаление аккаунта необратимо: библиотека, заметки и планы стираются вместе с ним.</p>
+          <div class="form-actions">
+            <button type="button" id="export-data" class="button-secondary">Скачать мои данные</button>
+            <button type="button" id="open-delete-account" class="button-secondary danger">Удалить аккаунт</button>
+          </div>
+          <form id="delete-account-form" class="hidden">
+            <label for="delete-account-password">Подтвердите пароль<input id="delete-account-password" type="password" autocomplete="current-password" required /></label>
+            <div class="form-actions">
+              <button type="submit" class="danger">Удалить аккаунт навсегда</button>
+              <button type="button" id="cancel-delete-account" class="button-secondary">Отмена</button>
+            </div>
+          </form>
+          <p id="account-data-status" class="status" aria-live="polite"></p>
+
+          <div id="users-admin" class="hidden">
+            <h3>Пользователи</h3>
+            <p class="development-intro">У каждого аккаунта своя библиотека книг, свой профиль, свои заметки и действия. Пользователи не видят данные друг друга.</p>
+            <form id="user-form" class="profile-form">
+              <div class="profile-grid">
+                <label for="new-username">Логин<input id="new-username" maxlength="32" placeholder="например, anna" required /></label>
+                <label for="new-display-name">Имя<input id="new-display-name" maxlength="120" placeholder="Анна Иванова" /></label>
+                <label for="new-user-email">Почта<input id="new-user-email" type="email" placeholder="Необязательно" /></label>
+                <label for="new-user-password">Пароль<input id="new-user-password" type="password" autocomplete="new-password" minlength="8" required /></label>
+                <label class="checkbox-label" for="new-user-admin"><input id="new-user-admin" type="checkbox" /> Администратор</label>
+              </div>
+              <div class="form-actions"><button type="submit">Добавить пользователя</button></div>
+            </form>
+            <p id="user-status" class="status" aria-live="polite"></p>
+            <div id="user-list" class="action-list"></div>
+          </div>
+        </div>
         </div>
       </details>
 
@@ -204,17 +258,122 @@
         <div id="memory-list" class="memory-list"><p class="empty-state">Сохранённых идей пока нет.</p></div>
       </section>
     </main>
-    <section id="auth-gate" class="auth-gate hidden" aria-labelledby="login-title">
-      <form id="login-form" class="login-card">
+
+    <div id="toast-host" class="toast-host" role="status" aria-live="polite"></div>
+
+    <section id="auth-gate" class="auth-gate hidden" role="dialog" aria-modal="true" aria-labelledby="auth-title">
+      <div class="login-card">
         <span class="brand-mark">N</span>
-        <p class="section-label">ЧАСТНЫЙ ДОСТУП</p>
-        <h1 id="login-title">Вход в NBrain</h1>
-        <p>Введите личный пароль, чтобы открыть библиотеку и стратегическую память.</p>
-        <label for="login-password">Пароль<input id="login-password" type="password" autocomplete="current-password" required /></label>
-        <button id="login-button" type="submit">Войти</button>
+        <p class="section-label">ЛИЧНЫЙ ДОСТУП</p>
+        <h1 id="auth-title">Вход в NBrain</h1>
+        <p id="auth-intro">Введите логин или почту и пароль, чтобы открыть свою библиотеку.</p>
+
+        <div class="auth-tabs" role="tablist" aria-label="Вход или регистрация">
+          <button type="button" class="auth-tab is-active" data-auth-tab="login" role="tab" aria-selected="true">Вход</button>
+          <button type="button" class="auth-tab" data-auth-tab="register" role="tab" aria-selected="false" id="auth-tab-register">Регистрация</button>
+        </div>
+
+        <form id="login-form" data-auth-panel="login">
+          <label for="login-username">Логин или почта<input id="login-username" autocomplete="username" required /></label>
+          <label for="login-password">Пароль<input id="login-password" type="password" autocomplete="current-password" required /></label>
+          <button id="login-button" type="submit">Войти</button>
+          <button type="button" class="link-button" data-auth-tab="forgot">Забыли пароль?</button>
+        </form>
+
+        <form id="register-form" data-auth-panel="register" class="hidden">
+          <label for="register-email">Почта<input id="register-email" type="email" autocomplete="email" required /></label>
+          <label for="register-name">Как к вам обращаться<input id="register-name" maxlength="120" autocomplete="name" placeholder="Необязательно" /></label>
+          <label for="register-password">Пароль<input id="register-password" type="password" autocomplete="new-password" minlength="8" required /></label>
+          <p class="field-help">Не короче 8 символов. На почту придёт письмо для подтверждения адреса — оно нужно, чтобы вы могли восстановить пароль сами.</p>
+          <button type="submit">Создать аккаунт</button>
+          <button type="button" class="link-button" data-auth-tab="login">У меня уже есть аккаунт</button>
+        </form>
+
+        <form id="forgot-form" data-auth-panel="forgot" class="hidden">
+          <label for="forgot-email">Почта аккаунта<input id="forgot-email" type="email" autocomplete="email" required /></label>
+          <p class="field-help">Пришлём ссылку для смены пароля, если такой аккаунт существует.</p>
+          <button type="submit">Прислать ссылку</button>
+          <button type="button" class="link-button" data-auth-tab="login">Вернуться ко входу</button>
+        </form>
+
+        <form id="reset-form" data-auth-panel="reset" class="hidden">
+          <label for="reset-password">Новый пароль<input id="reset-password" type="password" autocomplete="new-password" minlength="8" required /></label>
+          <p class="field-help">Не короче 8 символов. Ссылка сработает один раз.</p>
+          <button type="submit">Сохранить пароль</button>
+          <button type="button" class="link-button" data-auth-tab="login">Вернуться ко входу</button>
+        </form>
+
         <p id="login-status" class="status" aria-live="polite"></p>
+      </div>
+    </section>
+
+    <section id="onboarding-gate" class="auth-gate hidden" role="dialog" aria-modal="true" aria-labelledby="onboarding-title">
+      <form id="onboarding-form" class="login-card onboarding-card">
+        <p class="section-label">ЗНАКОМСТВО</p>
+        <h1 id="onboarding-title">Настроим обучение под вас</h1>
+        <p>Семь коротких вопросов. Ответы можно поменять в любой момент в профиле.</p>
+
+        <fieldset>
+          <legend>Какие темы вам интересны?</legend>
+          <div id="onboarding-topics" class="chip-grid"></div>
+        </fieldset>
+
+        <fieldset>
+          <legend>Какие навыки хотите развить?</legend>
+          <div id="onboarding-skills" class="chip-grid"></div>
+        </fieldset>
+
+        <label for="onboarding-goals">Чего хотите достичь
+          <textarea id="onboarding-goals" rows="3" placeholder="По одной цели в строке. Например: собрать стратегию на год"></textarea>
+        </label>
+
+        <label for="onboarding-read">Какие книги уже прочитали
+          <textarea id="onboarding-read" rows="2" placeholder="По одной книге в строке"></textarea>
+        </label>
+
+        <label for="onboarding-wanted">Какие книги хотите изучить
+          <textarea id="onboarding-wanted" rows="2" placeholder="По одной книге в строке"></textarea>
+        </label>
+
+        <div class="profile-grid">
+          <label for="onboarding-level">Ваш уровень
+            <select id="onboarding-level">
+              <option value="beginner">Начинаю разбираться</option>
+              <option value="intermediate" selected>Есть опыт</option>
+              <option value="advanced">Уверенно ориентируюсь</option>
+            </select>
+          </label>
+          <label for="onboarding-minutes">Минут в день на занятия
+            <input id="onboarding-minutes" type="number" min="5" max="480" step="5" value="20" required />
+          </label>
+          <label for="onboarding-date">К какой дате хотите результат
+            <input id="onboarding-date" type="date" />
+          </label>
+          <label for="onboarding-format">Предпочитаемый формат
+            <select id="onboarding-format">
+              <option value="mixed" selected>Смешанный</option>
+              <option value="full_text">Полный текст</option>
+              <option value="summary">Краткое содержание</option>
+              <option value="flashcards">Карточки</option>
+              <option value="quiz">Тесты</option>
+            </select>
+          </label>
+        </div>
+
+        <label class="checkbox-label" for="onboarding-personalization">
+          <input id="onboarding-personalization" type="checkbox" checked />
+          Использовать мои ответы для персональных рекомендаций
+        </label>
+        <p class="field-help">Без этого NBrain продолжит работать, но рекомендации будут общими.</p>
+
+        <div class="form-actions">
+          <button type="submit">Сохранить и начать</button>
+          <button type="button" class="button-secondary" id="onboarding-skip">Заполнить позже</button>
+        </div>
+        <p id="onboarding-status" class="status" aria-live="polite"></p>
       </form>
     </section>
+
     <script src="/web/app.js"></script>
   </body>
 </html>
