@@ -193,10 +193,25 @@ function clearWorkspace() {
     const field = $(selector);
     if (field) field.value = '';
   });
+  // The heading and the focus line carry the previous person's name and words,
+  // so they have to be reset too, not just the input fields.
+  $('#profile-title').textContent = 'Профиль';
+  $('#focus-summary').textContent = 'Укажите фокус в профиле, чтобы получать персональные рекомендации.';
   const library = $('#development-library-list');
   if (library) library.innerHTML = '';
   const recommendations = $('#development-recommendations');
   if (recommendations) recommendations.innerHTML = '';
+  ['#plan-list', '#flashcard-panel', '#lesson-body', '#reader-body', '#progress-body'].forEach((selector) => {
+    const node = $(selector);
+    if (node) node.innerHTML = '';
+  });
+  $('#lesson-view').classList.add('hidden');
+  $('#learning-plans-view').classList.remove('hidden');
+  readerBookId = '';
+  readerOpenedAt = 0;
+  currentPlan = null;
+  currentLesson = null;
+  cardQueue = [];
   verifyBanner.classList.add('hidden');
 }
 
@@ -214,10 +229,17 @@ function setCurrentUser(user) {
 
 // Every panel holds one person's data, so a switch of account has to reload
 // all of them together rather than leaving the previous library on screen.
-async function loadWorkspace() {
+async function loadWorkspace({ firstRun = false } = {}) {
   await Promise.all([loadProfile(), loadBooks(), loadActions(), loadMemories()]);
   await loadDevelopmentLibrary();
+  await Promise.all([loadPlans(), loadFlashcards(), loadProgress()]);
   if (currentUser && currentUser.is_admin) await loadUsers();
+  // Someone who just finished the questionnaire has an empty library, and the
+  // default section asks them to pick books they do not have. Start them where
+  // the first useful action is instead.
+  if (firstRun && !bookList.querySelector('.book-row') && !window.location.hash) {
+    goToSection('knowledge-section');
+  }
 }
 
 async function loadUsers() {
@@ -383,7 +405,9 @@ function setupWorkspaceNavigation() {
   const links = Array.from(document.querySelectorAll('[data-section-link]'));
   const panels = Array.from(document.querySelectorAll('[data-workspace-panel]'));
   const availableIds = new Set(panels.map((panel) => panel.dataset.workspacePanel));
-  const showSection = (id, writeHash = true) => {
+  // history mode: 'push' adds an entry (a section the person chose), 'replace'
+  // rewrites the current one (a move the script made), 'none' touches nothing.
+  const showSection = (id, history = 'replace') => {
     if (!availableIds.has(id)) return;
     panels.forEach((panel) => {
       panel.classList.toggle('workspace-hidden', panel.dataset.workspacePanel !== id);
@@ -392,18 +416,40 @@ function setupWorkspaceNavigation() {
       link.classList.toggle('is-active', link.dataset.sectionLink === id);
     });
     if (id === 'profile-section') $('#profile-section').open = true;
-    if (writeHash && window.location.hash !== `#${id}`) {
-      window.history.replaceState(null, '', `#${id}`);
+    // The reader has nothing on screen until a book is chosen, so opening the
+    // section is itself the request to open the last book being read.
+    // Numbers people check are numbers that must be current: the dashboard is
+    // refetched every time the section is opened, not once at sign-in.
+    if (id === 'progress-section') loadProgress();
+    if (id === 'reader-section' && !readerBookId) {
+      const picker = $('#reader-book');
+      if (picker && picker.value) openReaderPage(picker.value, 0);
+    }
+    if (history !== 'none' && window.location.hash !== `#${id}`) {
+      if (history === 'push') window.history.pushState(null, '', `#${id}`);
+      else window.history.replaceState(null, '', `#${id}`);
     }
   };
+  // Sections are switched in place, so without a history entry per click the
+  // back button walked straight off the site instead of returning to the
+  // section the person came from.
   links.forEach((link) => link.addEventListener('click', (event) => {
     event.preventDefault();
-    showSection(link.dataset.sectionLink);
+    showSection(link.dataset.sectionLink, 'push');
     window.scrollTo({ top: 0, behavior: 'smooth' });
   }));
+  window.addEventListener('popstate', () => {
+    const id = window.location.hash.slice(1);
+    showSection(availableIds.has(id) ? id : 'analysis-section', 'none');
+  });
+  goToSection = showSection;
   const requestedId = window.location.hash.slice(1);
-  showSection(availableIds.has(requestedId) ? requestedId : 'analysis-section', false);
+  showSection(availableIds.has(requestedId) ? requestedId : 'analysis-section', 'none');
 }
+
+// Assigned by setupWorkspaceNavigation; lets the rest of the script move the
+// person to a section without duplicating the panel bookkeeping.
+let goToSection = () => {};
 
 // The links in e-mail point at /verify and /reset; the server serves the same
 // page for both and the token is exchanged here.
@@ -624,13 +670,14 @@ $('#onboarding-form').addEventListener('submit', async (event) => {
       }));
     onboardingGate.classList.add('hidden');
     toast('Анкета сохранена. Ответы можно изменить в профиле.', 'success');
-    await loadWorkspace();
+    await loadWorkspace({ firstRun: true });
   } catch (error) { /* status line already shows it */ }
 });
 
-$('#onboarding-skip').addEventListener('click', () => {
+$('#onboarding-skip').addEventListener('click', async () => {
   onboardingGate.classList.add('hidden');
   toast('Анкету можно заполнить позже — раздел «Профиль».');
+  await loadWorkspace({ firstRun: true });
 });
 
 const bookStatusLabels = { ready: 'Готово', indexing: 'Индексируется', failed: 'Ошибка' };
@@ -640,9 +687,26 @@ function renderBooks(books) {
   const checked = new Set(selectedBookIds());
   bookFilter.innerHTML = '';
   if (!books.length) {
-    bookList.innerHTML = '<p class="empty-state">Книги пока не загружены.</p>';
+    // A brand-new account owns nothing: libraries are personal, so there is
+    // literally nothing to read until this person adds a file. Saying so, and
+    // saying what to do about it, beats a bare "no books yet".
+    fillBookSelects(books);
+    bookList.innerHTML = `
+      <div class="empty-state empty-cta">
+        <p><strong>Здесь пока пусто.</strong> Библиотека у каждого своя, поэтому первую книгу нужно загрузить самому.</p>
+        <p>Подойдёт PDF, EPUB или TXT до 50 МБ. NBrain разберёт текст на фрагменты и после этого сможет отвечать на вопросы по книге со ссылками на страницы.</p>
+        <button type="button" id="empty-upload-hint">Загрузить первую книгу</button>
+      </div>`;
+    const hint = $('#empty-upload-hint');
+    if (hint) hint.addEventListener('click', () => {
+      goToSection('knowledge-section');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      const picker = $('#book-file');
+      if (picker) picker.click();
+    });
     return;
   }
+  fillBookSelects(books);
   bookList.innerHTML = books.map((book) => {
     const detail = book.status === 'ready'
       ? `${book.page_count} стр. · ${book.chunk_count} фрагментов`
@@ -941,7 +1005,7 @@ async function loadProfile() {
     $('#director-goals').value = profile.goals || '';
     $('#director-focus').value = profile.focus || '';
     $('#focus-summary').textContent = profile.focus || 'Укажите фокус в профиле, чтобы получать персональные рекомендации.';
-    $('#profile-title').textContent = profile.name ? `Профиль: ${profile.name}` : 'Профиль директора';
+    $('#profile-title').textContent = profile.name ? `Профиль: ${profile.name}` : 'Профиль';
   } catch (error) {
     setStatus(profileStatus, error.message, true);
     reportError(error, 'Не удалось загрузить профиль.');
@@ -967,6 +1031,12 @@ $('#profile-form').addEventListener('submit', async (event) => {
     });
     $('#director-strengths').value = strengthsToText(profile.strengths);
     $('#focus-summary').textContent = profile.focus || 'Укажите фокус в профиле, чтобы получать персональные рекомендации.';
+    $('#profile-title').textContent = profile.name ? `Профиль: ${profile.name}` : 'Профиль';
+    // The name in the header is the same name, so it changes here and now
+    // instead of waiting for the next sign-in.
+    if (currentUser) {
+      setCurrentUser({ ...currentUser, display_name: profile.name || currentUser.username });
+    }
     setStatus(profileStatus, 'Профиль сохранён. Следующие ответы будут учитывать этот контекст.');
     await loadDevelopmentLibrary();
   } catch (error) {
@@ -1347,6 +1417,551 @@ async function findOrAnswer(withAnswer) {
     button.disabled = false;
   }
 }
+
+// ==========================================================================
+// Обучение: планы, занятия, тесты, карточки
+// ==========================================================================
+
+const planStatus = $('#plan-status');
+let readyBooks = [];
+let currentPlan = null;
+let currentLesson = null;
+let quizChecked = false;
+
+function fillBookSelects(books) {
+  readyBooks = books.filter((book) => book.status === 'ready');
+  const options = readyBooks.map((book) => `<option value="${escapeHtml(book.id)}">${escapeHtml(displayBookTitle(book.title))}</option>`).join('');
+  for (const selector of ['#plan-book', '#reader-book']) {
+    const select = $(selector);
+    if (!select) continue;
+    const previous = select.value;
+    select.innerHTML = options || '<option value="">Нет готовых книг</option>';
+    if (previous && readyBooks.some((book) => book.id === previous)) select.value = previous;
+  }
+}
+
+function planDate(value) {
+  if (!value) return '';
+  const [year, month, day] = String(value).split('-');
+  return `${day}.${month}.${year}`;
+}
+
+async function loadPlans() {
+  try {
+    const { plans } = await api('/api/plans');
+    const host = $('#plan-list');
+    if (!plans.length) {
+      host.innerHTML = readyBooks.length
+        ? '<p class="empty-state">Планов пока нет. Выберите книгу выше и составьте первый.</p>'
+        : '<p class="empty-state">Сначала загрузите и дождитесь индексации книги в разделе «Книги».</p>';
+      return;
+    }
+    host.innerHTML = plans.map((plan) => `
+      <article class="plan-row">
+        <div>
+          <h4>${escapeHtml(plan.book_title)}</h4>
+          <p class="recommendation-meta">${plan.done_lessons || 0} из ${plan.total_lessons || 0} занятий${plan.target_date ? ` · до ${planDate(plan.target_date)}` : ''} · ${plan.daily_minutes} мин в день</p>
+          <div class="progress-bar"><span data-width="${plan.percent}%"></span></div>
+        </div>
+        <div class="plan-row-actions">
+          <button type="button" data-open-plan="${escapeHtml(plan.id)}">Открыть</button>
+          <button type="button" class="button-secondary danger" data-delete-plan="${escapeHtml(plan.id)}">Удалить</button>
+        </div>
+      </article>`).join('');
+    applySizes(host);
+  } catch (error) {
+    reportError(error, 'Не удалось загрузить планы.');
+  }
+}
+
+$('#plan-list').addEventListener('click', async (event) => {
+  const open = event.target.closest('[data-open-plan]');
+  const remove = event.target.closest('[data-delete-plan]');
+  if (open) return openPlan(open.dataset.openPlan);
+  if (!remove) return;
+  if (!window.confirm('Удалить план вместе с занятиями и вопросами? Карточки останутся.')) return;
+  try {
+    await postJson('/api/plans/delete', { id: remove.dataset.deletePlan });
+    toast('План удалён.');
+    await loadPlans();
+  } catch (error) { reportError(error); }
+});
+
+async function openPlan(planId) {
+  try {
+    const { plan } = await api(`/api/plan?id=${encodeURIComponent(planId)}`);
+    currentPlan = plan;
+    renderPlan(plan);
+  } catch (error) { reportError(error); }
+}
+
+function lessonStatusLabel(lesson) {
+  if (lesson.status === 'done') return `<span class="pill pill-done">Пройдено${lesson.score !== null ? ` · ${lesson.score}%` : ''}</span>`;
+  if (lesson.generated_at) return '<span class="pill pill-progress">Материал готов</span>';
+  return '<span class="pill">Запланировано</span>';
+}
+
+function renderPlan(plan) {
+  $('#learning-plans-view').classList.add('hidden');
+  $('#lesson-view').classList.remove('hidden');
+  $('#lesson-body').innerHTML = `
+    <div class="section-heading">
+      <div>
+        <p class="section-label">ПЛАН</p>
+        <h2>${escapeHtml(plan.book_title)}</h2>
+        <p>${plan.done_lessons} из ${plan.total_lessons} занятий пройдено${plan.target_date ? ` · цель ${planDate(plan.target_date)}` : ''} · осталось примерно ${plan.minutes_left} мин.</p>
+        ${plan.goal ? `<p class="field-help">Ваша цель: ${escapeHtml(plan.goal)}</p>` : ''}
+      </div>
+    </div>
+    <div class="progress-bar big"><span data-width="${plan.percent}%"></span></div>
+    <div class="lesson-list">${plan.lessons.map((lesson) => `
+      <article class="lesson-row${lesson.status === 'done' ? ' is-done' : ''}">
+        <div>
+          <h4>${escapeHtml(lesson.title)}</h4>
+          <p class="recommendation-meta">стр. ${lesson.page_from}–${lesson.page_to} · ${lesson.estimated_minutes} мин${lesson.scheduled_for ? ` · ${planDate(lesson.scheduled_for)}` : ''}</p>
+        </div>
+        <div class="lesson-row-side">${lessonStatusLabel(lesson)}
+          <button type="button" data-open-lesson="${escapeHtml(lesson.id)}">${lesson.status === 'done' ? 'Повторить' : 'Открыть'}</button>
+        </div>
+      </article>`).join('')}</div>`;
+  applySizes($('#lesson-body'));
+}
+
+$('#lesson-body').addEventListener('click', async (event) => {
+  const open = event.target.closest('[data-open-lesson]');
+  if (open) return openLesson(open.dataset.openLesson);
+  const generate = event.target.closest('#lesson-generate');
+  if (generate) return generateLesson(generate.dataset.lessonId, generate.dataset.force === '1');
+  const backToPlan = event.target.closest('#lesson-to-plan');
+  if (backToPlan && currentPlan) return openPlan(currentPlan.id);
+  const nav = event.target.closest('[data-goto-lesson]');
+  if (nav) return openLesson(nav.dataset.gotoLesson);
+  const read = event.target.closest('[data-read-pages]');
+  if (read) {
+    const select = $('#reader-book');
+    if (select) select.value = read.dataset.readBook;
+    goToSection('reader-section');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+    return openReaderPage(read.dataset.readBook, Number(read.dataset.readPages));
+  }
+});
+
+async function openLesson(lessonId) {
+  try {
+    const { lesson } = await api(`/api/lesson?id=${encodeURIComponent(lessonId)}`);
+    currentLesson = lesson;
+    quizChecked = false;
+    $('#learning-plans-view').classList.add('hidden');
+    $('#lesson-view').classList.remove('hidden');
+    renderLesson(lesson);
+  } catch (error) { reportError(error); }
+}
+
+function renderIdeaList(items) {
+  return items.map((item) => `<li>${escapeHtml(item.idea)}${item.why ? ` — <span class="muted-text">${escapeHtml(item.why)}</span>` : ''}${item.page ? ` <em class="page-ref">стр. ${item.page}</em>` : ''}</li>`).join('');
+}
+
+function renderLesson(lesson) {
+  const generated = lesson.generated;
+  $('#lesson-body').innerHTML = `
+    <div class="section-heading">
+      <div>
+        <p class="section-label">ЗАНЯТИЕ ${lesson.ordinal}</p>
+        <h2>${escapeHtml(lesson.title)}</h2>
+        <p class="recommendation-meta">${escapeHtml(lesson.book_title)} · стр. ${lesson.page_from}–${lesson.page_to} · ${lesson.estimated_minutes} мин${lesson.scheduled_for ? ` · ${planDate(lesson.scheduled_for)}` : ''}</p>
+        ${lesson.goal ? `<p>${escapeHtml(lesson.goal)}</p>` : ''}
+      </div>
+      <div class="lesson-row-side">
+        <button type="button" id="lesson-to-plan" class="button-secondary">К плану</button>
+        <button type="button" data-read-book="${escapeHtml(lesson.book_id)}" data-read-pages="${lesson.page_from}" class="button-secondary">Читать страницы</button>
+      </div>
+    </div>
+    ${generated ? '' : `
+      <div class="empty-cta">
+        <p><strong>Материал занятия ещё не сформирован.</strong> NBrain прочитает страницы ${lesson.page_from}–${lesson.page_to} вашей книги и составит конспект, ключевые идеи, термины, цитаты, пять вопросов и шесть карточек.</p>
+        <p>Это один запрос к языковой модели, результат сохраняется — повторно платить не придётся.</p>
+        <button type="button" id="lesson-generate" data-lesson-id="${escapeHtml(lesson.id)}">Сформировать материал занятия</button>
+      </div>`}
+    ${generated ? `
+      <p class="disclaimer-note">${escapeHtml(lesson.disclaimer)}</p>
+      <h3>Краткое содержание</h3>
+      <div class="lesson-summary">${lesson.summary.split(/\n{2,}/).map((part) => `<p>${escapeHtml(part)}</p>`).join('')}</div>
+      ${lesson.key_ideas.length ? `<h3>Ключевые идеи</h3><ul class="lesson-ul">${renderIdeaList(lesson.key_ideas)}</ul>` : ''}
+      ${lesson.terms.length ? `<h3>Термины</h3><ul class="lesson-ul">${lesson.terms.map((term) => `<li><strong>${escapeHtml(term.term)}</strong> — ${escapeHtml(term.meaning)}${term.page ? ` <em class="page-ref">стр. ${term.page}</em>` : ''}</li>`).join('')}</ul>` : ''}
+      ${lesson.quotes.length ? `<h3>Цитаты</h3>${lesson.quotes.map((quote) => `<blockquote>${escapeHtml(quote.text)}${quote.page ? `<em class="page-ref"> стр. ${quote.page}</em>` : ''}</blockquote>`).join('')}` : ''}
+      ${lesson.practice ? `<h3>Практика</h3><p>${escapeHtml(lesson.practice)}</p>` : ''}
+      ${lesson.questions.length ? `<h3>Проверьте себя</h3><form id="quiz-form" class="quiz-form">${lesson.questions.map((question, index) => `
+        <fieldset class="quiz-question" data-question="${escapeHtml(question.id)}">
+          <legend>${index + 1}. ${escapeHtml(question.prompt)}</legend>
+          ${question.options.map((option, optionIndex) => `
+            <label class="quiz-option"><input type="radio" name="q-${escapeHtml(question.id)}" value="${optionIndex}" /> <span>${escapeHtml(option)}</span></label>`).join('')}
+          <p class="quiz-feedback hidden"></p>
+        </fieldset>`).join('')}
+        <div class="form-actions"><button type="submit">Проверить ответы</button>
+          <button type="button" id="lesson-generate" class="button-secondary" data-lesson-id="${escapeHtml(lesson.id)}" data-force="1">Пересобрать материал</button></div>
+        <p id="quiz-status" class="status" aria-live="polite"></p>
+      </form>` : ''}
+      <div class="lesson-nav">
+        ${lesson.prev_lesson ? `<button type="button" class="button-secondary" data-goto-lesson="${escapeHtml(lesson.prev_lesson)}">← Предыдущее</button>` : '<span></span>'}
+        ${lesson.next_lesson ? `<button type="button" class="button-secondary" data-goto-lesson="${escapeHtml(lesson.next_lesson)}">Следующее →</button>` : '<span></span>'}
+      </div>` : ''}`;
+  const quizForm = $('#quiz-form');
+  if (quizForm) quizForm.addEventListener('submit', submitQuiz);
+}
+
+async function generateLesson(lessonId, force) {
+  const button = $('#lesson-generate');
+  if (button) button.disabled = true;
+  toast('Читаю страницы и собираю материал — это занимает до минуты.');
+  try {
+    const { lesson } = await postJson('/api/lesson/generate', { id: lessonId, force });
+    currentLesson = lesson;
+    renderLesson(lesson);
+    toast('Материал занятия готов.', 'success');
+  } catch (error) {
+    reportError(error, 'Не удалось собрать материал занятия.');
+    if (button) button.disabled = false;
+  }
+}
+
+async function submitQuiz(event) {
+  event.preventDefault();
+  const form = event.target;
+  const answers = {};
+  let unanswered = 0;
+  form.querySelectorAll('.quiz-question').forEach((field) => {
+    const chosen = field.querySelector('input:checked');
+    if (chosen) answers[field.dataset.question] = Number(chosen.value);
+    else unanswered += 1;
+  });
+  if (unanswered) {
+    setStatus($('#quiz-status'), `Не отвечено вопросов: ${unanswered}. Ответьте на все и повторите.`, true);
+    return;
+  }
+  try {
+    const result = await withBusy(form.querySelector('button[type=submit]'), $('#quiz-status'), 'Проверяю…', () =>
+      postJson('/api/lesson/quiz', { lesson_id: currentLesson.id, answers }));
+    quizChecked = true;
+    result.results.forEach((item) => {
+      const field = form.querySelector(`[data-question="${CSS.escape(item.id)}"]`);
+      if (!field) return;
+      field.classList.add(item.correct ? 'is-correct' : 'is-wrong');
+      const feedback = field.querySelector('.quiz-feedback');
+      feedback.classList.remove('hidden');
+      feedback.textContent = item.correct
+        ? `Верно. ${item.explanation}`
+        : `Правильный ответ: ${item.options[item.answer]}. ${item.explanation}`;
+    });
+    setStatus($('#quiz-status'), `${result.correct} из ${result.total} — ${result.score}%. ${result.advice}`);
+    toast(result.passed ? `Занятие пройдено: ${result.score}%` : `Результат ${result.score}% — стоит повторить`, result.passed ? 'success' : 'info');
+    await Promise.all([loadFlashcards(), loadPlans(), loadProgress()]);
+  } catch (error) { /* status line shows it */ }
+}
+
+$('#lesson-back').addEventListener('click', () => {
+  $('#lesson-view').classList.add('hidden');
+  $('#learning-plans-view').classList.remove('hidden');
+  loadPlans();
+});
+
+$('#plan-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const bookId = $('#plan-book').value;
+  if (!bookId) {
+    setStatus(planStatus, 'Сначала загрузите книгу и дождитесь индексации.', true);
+    return;
+  }
+  try {
+    const { plan } = await withBusy(event.target.querySelector('button[type=submit]'), planStatus, 'Составляю план…', () =>
+      postJson('/api/plans', {
+        book_id: bookId,
+        daily_minutes: Number($('#plan-minutes').value),
+        target_date: $('#plan-date').value,
+        goal: $('#plan-goal').value,
+      }));
+    toast(`План готов: ${plan.total_lessons} занятий.`, 'success');
+    await loadPlans();
+    openPlan(plan.id);
+  } catch (error) { /* status line shows it */ }
+});
+
+// --- Карточки ---
+let cardQueue = [];
+let cardIndex = 0;
+let cardsReviewed = 0;
+
+async function loadFlashcards() {
+  try {
+    const payload = await api('/api/flashcards');
+    cardQueue = payload.cards || [];
+    cardIndex = 0;
+    renderFlashcards(payload);
+  } catch (error) {
+    reportError(error, 'Не удалось загрузить карточки.');
+  }
+}
+
+function renderFlashcards(payload) {
+  const host = $('#flashcard-panel');
+  if (!payload.total) {
+    host.innerHTML = '<p class="empty-state">Карточки появятся, когда вы сформируете материал первого занятия.</p>';
+    return;
+  }
+  if (!cardQueue.length || cardIndex >= cardQueue.length) {
+    host.innerHTML = `<div class="empty-cta"><p><strong>На сегодня повторение закончено.</strong> Всего карточек: ${payload.total}. Следующие вернутся по расписанию.</p></div>`;
+    return;
+  }
+  const card = cardQueue[cardIndex];
+  host.innerHTML = `
+    <div class="flashcard">
+      <p class="recommendation-meta">${escapeHtml(card.book_title || '')}${card.source_pages ? ` · стр. ${escapeHtml(card.source_pages)}` : ''} · осталось ${cardQueue.length - cardIndex}</p>
+      <h4>${escapeHtml(card.front)}</h4>
+      <p class="flashcard-back hidden">${escapeHtml(card.back)}</p>
+      <div class="form-actions">
+        <button type="button" id="card-show">Показать ответ</button>
+      </div>
+      <div class="form-actions card-grades hidden">
+        <button type="button" class="button-secondary" data-grade="again">Не вспомнил</button>
+        <button type="button" class="button-secondary" data-grade="hard">С трудом</button>
+        <button type="button" data-grade="good">Вспомнил</button>
+        <button type="button" class="button-secondary" data-grade="easy">Легко</button>
+      </div>
+    </div>`;
+}
+
+$('#flashcard-panel').addEventListener('click', async (event) => {
+  if (event.target.closest('#card-show')) {
+    $('.flashcard-back').classList.remove('hidden');
+    $('.card-grades').classList.remove('hidden');
+    $('#card-show').classList.add('hidden');
+    return;
+  }
+  const grade = event.target.closest('[data-grade]');
+  if (!grade) return;
+  const card = cardQueue[cardIndex];
+  grade.disabled = true;
+  try {
+    const result = await postJson('/api/flashcards/review', { id: card.id, grade: grade.dataset.grade });
+    cardsReviewed += 1;
+    cardIndex += 1;
+    toast(`Карточка вернётся ${result.next_in}.`);
+    if (cardIndex >= cardQueue.length) {
+      const payload = await postJson('/api/flashcards/finish', { reviewed: cardsReviewed });
+      cardsReviewed = 0;
+      cardQueue = [];
+      renderFlashcards(payload);
+      await loadProgress();
+    } else {
+      renderFlashcards({ total: cardQueue.length });
+    }
+  } catch (error) {
+    reportError(error);
+    grade.disabled = false;
+  }
+});
+
+// ==========================================================================
+// Читалка
+// ==========================================================================
+
+let readerBookId = '';
+let readerPage = 1;
+let readerOpenedAt = 0;
+
+async function openReaderPage(bookId, page) {
+  if (!bookId) {
+    $('#reader-body').innerHTML = '<p class="empty-state">Выберите книгу — или сначала загрузите её в разделе «Книги».</p>';
+    return;
+  }
+  await flushReadingTime();
+  readerBookId = bookId;
+  $('#reader-body').setAttribute('aria-busy', 'true');
+  try {
+    const state = await api(`/api/reader/state?book_id=${encodeURIComponent(bookId)}`);
+    // Page 0 means "wherever I stopped last time" — that is what makes the
+    // reader worth opening on a second device.
+    const wanted = page || state.page_no || 1;
+    const pagePayload = await api(`/api/reader/page?book_id=${encodeURIComponent(bookId)}&page=${wanted}`);
+    readerPage = pagePayload.page_no;
+    readerOpenedAt = Date.now();
+    renderReader(pagePayload, state);
+  } catch (error) {
+    $('#reader-body').innerHTML = `<p class="empty-state error">${escapeHtml(error.message)}</p>`;
+    reportError(error, 'Не удалось открыть книгу.');
+  } finally {
+    $('#reader-body').removeAttribute('aria-busy');
+  }
+}
+
+function renderReader(page, state) {
+  $('#reader-body').innerHTML = `
+    <div class="reader-toolbar">
+      <div class="progress-bar big"><span data-width="${state.percent}%"></span></div>
+      <p class="recommendation-meta">Страница ${page.page_no} из ${page.total_pages} · прочитано ${state.percent}% · осталось примерно ${state.minutes_left} мин.</p>
+    </div>
+    <div class="reader-page">${page.content.split(/\n{2,}/).map((part) => `<p>${escapeHtml(part)}</p>`).join('')}</div>
+    <div class="reader-actions">
+      <button type="button" class="button-secondary" data-reader-page="${page.prev_page || ''}" ${page.prev_page ? '' : 'disabled'}>← Назад</button>
+      <button type="button" id="reader-bookmark" class="button-secondary">${page.bookmarked ? '★ В закладках' : '☆ В закладки'}</button>
+      <button type="button" id="reader-note" class="button-secondary">Заметка к странице</button>
+      <button type="button" data-reader-page="${page.next_page || ''}" ${page.next_page ? '' : 'disabled'}>Дальше →</button>
+    </div>
+    <form id="reader-note-form" class="hidden">
+      <label for="reader-note-quote">Цитата со страницы<input id="reader-note-quote" maxlength="1000" placeholder="Необязательно" /></label>
+      <label for="reader-note-text">Ваша мысль<textarea id="reader-note-text" rows="3" required></textarea></label>
+      <div class="form-actions"><button type="submit">Сохранить заметку</button>
+        <button type="button" id="reader-note-cancel" class="button-secondary">Отмена</button></div>
+    </form>
+    ${page.notes.length ? `<h3>Заметки к этой странице</h3><div class="note-list">${page.notes.map((note) => `
+      <article class="note-row">
+        ${note.quote ? `<blockquote>${escapeHtml(note.quote)}</blockquote>` : ''}
+        <p>${escapeHtml(note.content)}</p>
+        <button type="button" class="link-button" data-delete-note="${escapeHtml(note.id)}">Удалить</button>
+      </article>`).join('')}</div>` : ''}
+    ${state.bookmarks.length ? `<h3>Закладки</h3><div class="chip-grid">${state.bookmarks.map((mark) => `
+      <button type="button" class="chip-button" data-reader-page="${mark.page_no}">стр. ${mark.page_no}</button>`).join('')}</div>` : ''}`;
+  applySizes($('#reader-body'));
+}
+
+async function flushReadingTime() {
+  if (!readerBookId || !readerOpenedAt) return;
+  const seconds = Math.min(3600, Math.round((Date.now() - readerOpenedAt) / 1000));
+  readerOpenedAt = 0;
+  if (seconds < 3) return;
+  try {
+    await postJson('/api/reader/progress', { book_id: readerBookId, page_no: readerPage, seconds });
+  } catch (error) { /* progress is best-effort; never block the reader */ }
+}
+
+$('#reader-body').addEventListener('click', async (event) => {
+  const nav = event.target.closest('[data-reader-page]');
+  if (nav && nav.dataset.readerPage) return openReaderPage(readerBookId, Number(nav.dataset.readerPage));
+  if (event.target.closest('#reader-bookmark')) {
+    try {
+      const result = await postJson('/api/reader/bookmark', { book_id: readerBookId, page_no: readerPage });
+      toast(result.bookmarked ? 'Закладка поставлена.' : 'Закладка снята.');
+      return openReaderPage(readerBookId, readerPage);
+    } catch (error) { return reportError(error); }
+  }
+  if (event.target.closest('#reader-note')) {
+    $('#reader-note-form').classList.remove('hidden');
+    $('#reader-note-text').focus();
+    return;
+  }
+  if (event.target.closest('#reader-note-cancel')) {
+    $('#reader-note-form').classList.add('hidden');
+    return;
+  }
+  const removeNote = event.target.closest('[data-delete-note]');
+  if (removeNote) {
+    try {
+      await postJson('/api/notes/delete', { id: removeNote.dataset.deleteNote });
+      toast('Заметка удалена.');
+      return openReaderPage(readerBookId, readerPage);
+    } catch (error) { return reportError(error); }
+  }
+});
+
+$('#reader-body').addEventListener('submit', async (event) => {
+  if (event.target.id !== 'reader-note-form') return;
+  event.preventDefault();
+  try {
+    await postJson('/api/notes', {
+      book_id: readerBookId,
+      page_no: readerPage,
+      quote: $('#reader-note-quote').value,
+      content: $('#reader-note-text').value,
+    });
+    toast('Заметка сохранена.', 'success');
+    await openReaderPage(readerBookId, readerPage);
+  } catch (error) { reportError(error); }
+});
+
+$('#reader-book').addEventListener('change', (event) => openReaderPage(event.target.value, 1));
+window.addEventListener('beforeunload', flushReadingTime);
+
+// ==========================================================================
+// Прогресс
+// ==========================================================================
+
+
+// Политика безопасности запрещает атрибут style в разметке — иначе полосы
+// прогресса рисовались бы пустыми, а браузер молча сыпал бы предупреждениями.
+// Размеры задаются через CSSOM уже после вставки: это CSP не запрещает.
+function applySizes(root) {
+  if (!root) return;
+  root.querySelectorAll('[data-width]').forEach((node) => { node.style.width = node.dataset.width; });
+  root.querySelectorAll('[data-height]').forEach((node) => { node.style.height = node.dataset.height; });
+}
+
+function statTile(value, label) {
+  return `<div class="stat-tile"><strong>${escapeHtml(String(value))}</strong><span>${escapeHtml(label)}</span></div>`;
+}
+
+async function loadProgress() {
+  const host = $('#progress-body');
+  host.setAttribute('aria-busy', 'true');
+  try {
+    const data = await api('/api/progress');
+    const peak = Math.max(1, ...data.minutes_by_day.map((day) => day.minutes));
+    host.innerHTML = `
+      <div class="stat-row">
+        ${statTile(data.streak, data.streak === 1 ? 'день подряд' : 'дней подряд')}
+        ${statTile(data.minutes_total, 'минут занятий')}
+        ${statTile(data.lessons_done, 'занятий пройдено')}
+        ${statTile(data.average_score === null ? '—' : `${data.average_score}%`, 'средний балл')}
+        ${statTile(data.cards_due, 'карточек к повторению')}
+        ${statTile(data.notes_total, 'заметок')}
+      </div>
+      ${data.minutes_by_day.length ? `<h3>Занятия за 30 дней</h3>
+        <div class="day-chart" role="img" aria-label="Минуты занятий по дням за последние 30 дней">
+          ${data.minutes_by_day.map((day) => `<span title="${escapeHtml(day.day)}: ${day.minutes} мин"${day.minutes ? '' : ' data-empty="1"'} data-height="${day.minutes ? Math.max(8, Math.round(100 * day.minutes / peak)) : 4}%"></span>`).join('')}
+        </div>` : '<p class="empty-state">Данных пока нет — статистика появится после первого занятия.</p>'}
+      ${data.upcoming.length ? `<h3>Ближайшие занятия${data.overdue_lessons ? ` · просрочено ${data.overdue_lessons}` : ''}</h3>
+        <div class="lesson-list">${data.upcoming.map((lesson) => `
+          <article class="lesson-row">
+            <div><h4>${escapeHtml(lesson.title)}</h4>
+              <p class="recommendation-meta">${escapeHtml(lesson.book_title)} · ${lesson.estimated_minutes} мин${lesson.scheduled_for ? ` · ${planDate(lesson.scheduled_for)}` : ''}</p></div>
+            <button type="button" data-progress-lesson="${escapeHtml(lesson.id)}">Открыть</button>
+          </article>`).join('')}</div>` : ''}
+      ${data.reading.length ? `<h3>Чтение</h3>
+        <div class="lesson-list">${data.reading.map((item) => `
+          <article class="lesson-row">
+            <div><h4>${escapeHtml(item.book_title)}</h4>
+              <p class="recommendation-meta">страница ${item.page_no} из ${item.total_pages} · ${item.percent}%</p>
+              <div class="progress-bar"><span data-width="${item.percent}%"></span></div></div>
+            <button type="button" class="button-secondary" data-progress-book="${escapeHtml(item.book_id)}">Продолжить</button>
+          </article>`).join('')}</div>` : ''}
+      <h3>Достижения</h3>
+      <div class="chip-grid">${data.achievements.map((item) => `
+        <span class="achievement${item.earned ? ' is-earned' : ''}" title="${escapeHtml(item.description)}">${item.earned ? '★' : '☆'} ${escapeHtml(item.title)}</span>`).join('')}</div>`;
+    applySizes(host);
+  } catch (error) {
+    if (error.message !== SESSION_EXPIRED) {
+      host.innerHTML = `<p class="empty-state error">${escapeHtml(error.message)}</p>`;
+      reportError(error, 'Не удалось загрузить статистику.');
+    }
+  } finally {
+    host.removeAttribute('aria-busy');
+  }
+}
+
+$('#progress-body').addEventListener('click', (event) => {
+  const lesson = event.target.closest('[data-progress-lesson]');
+  if (lesson) {
+    goToSection('learning-section');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+    return openLesson(lesson.dataset.progressLesson);
+  }
+  const book = event.target.closest('[data-progress-book]');
+  if (book) {
+    const select = $('#reader-book');
+    if (select) select.value = book.dataset.progressBook;
+    goToSection('reader-section');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+    return openReaderPage(book.dataset.progressBook, 0);
+  }
+});
 
 $('#question-form').addEventListener('submit', (event) => { event.preventDefault(); findOrAnswer(true); });
 $('#search-button').addEventListener('click', () => findOrAnswer(false));

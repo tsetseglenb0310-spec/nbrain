@@ -17,6 +17,9 @@ COPY . ./
 ENV NBRAIN_HOST=0.0.0.0
 ENV NBRAIN_PORT=8000
 ENV NBRAIN_DATA_DIR=/app/data
+# Belt and braces with the line-buffering set in server.py: anything printed
+# before that runs still has to reach the platform log.
+ENV PYTHONUNBUFFERED=1
 
 RUN mkdir -p /app/data
 

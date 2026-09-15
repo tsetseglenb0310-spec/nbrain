@@ -137,3 +137,78 @@ button.danger:hover { background: #8a2f3f; }
 @media (prefers-reduced-motion: reduce) {
   * { animation-duration: .001ms !important; transition-duration: .001ms !important; scroll-behavior: auto !important; }
 }
+
+/* Пустая библиотека у нового аккаунта — это не ошибка, а первый шаг. */
+.empty-cta { display: grid; gap: 10px; justify-items: start; padding: 20px; border: 1px dashed #cbdce9; border-radius: 13px; background: #fafdff; color: var(--muted); line-height: 1.5; }
+.empty-cta p { margin: 0; }
+.empty-cta strong { color: var(--ink); }
+
+/* --- Обучение: планы, занятия, тесты, карточки --- */
+.plan-list, .lesson-list, .note-list { display: grid; gap: 10px; margin-top: 12px; }
+.plan-row, .lesson-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 15px; border: 1px solid #e5edf3; border-radius: 12px; background: #fbfdff; }
+.plan-row h4, .lesson-row h4 { margin: 0 0 4px; font-size: .98rem; }
+.plan-row-actions, .lesson-row-side { display: flex; align-items: center; gap: 8px; flex: none; }
+.lesson-row.is-done { opacity: .72; }
+.progress-bar { height: 7px; margin-top: 8px; border-radius: 999px; background: #e3ecf3; overflow: hidden; }
+.progress-bar.big { height: 11px; margin: 14px 0; }
+.progress-bar span { display: block; height: 100%; border-radius: 999px; background: linear-gradient(90deg, #2b66a1, #4d95ca); transition: width .3s; }
+.pill { display: inline-block; padding: 5px 10px; border-radius: 999px; background: #eef4f9; color: var(--navy-soft); font-size: .76rem; font-weight: 800; }
+.pill-done { color: #0f6b4c; background: #e3f4ec; }
+.pill-progress { color: #1f5a99; background: #e4f0fa; }
+.disclaimer-note { margin: 14px 0 0; padding: 11px 14px; border-left: 4px solid #e4d5a8; border-radius: 0 10px 10px 0; background: #fdf9ee; color: #6b5312; font-size: .87rem; line-height: 1.5; }
+.lesson-summary p { color: #33506a; line-height: 1.65; }
+.lesson-ul { margin: 0; padding-left: 20px; color: #33506a; line-height: 1.6; }
+.lesson-ul li { margin-bottom: 8px; }
+.page-ref { color: var(--blue); font-size: .82rem; font-style: normal; font-weight: 800; }
+.muted-text { color: var(--muted); }
+blockquote { margin: 10px 0; padding: 12px 15px; border-left: 4px solid #8db8d8; border-radius: 0 11px 11px 0; background: #f3f8fc; color: #35526a; line-height: 1.55; }
+.lesson-nav { display: flex; justify-content: space-between; gap: 10px; margin-top: 22px; }
+
+.quiz-form { display: grid; gap: 14px; margin-top: 12px; }
+.quiz-question { margin: 0; padding: 15px; border: 1px solid #e5edf3; border-radius: 12px; background: #fbfdff; }
+.quiz-question legend { padding: 0 6px; font-size: .93rem; font-weight: 780; }
+.quiz-question.is-correct { border-color: #96cbaa; background: #f2fbf6; }
+.quiz-question.is-wrong { border-color: #e0aab0; background: #fdf4f5; }
+.quiz-option { display: flex; align-items: start; gap: 9px; padding: 7px 4px; cursor: pointer; line-height: 1.45; }
+.quiz-option input { flex: none; width: 16px; height: 16px; margin-top: 2px; accent-color: var(--blue); }
+.quiz-feedback { margin: 8px 0 0; color: #33506a; font-size: .87rem; line-height: 1.5; }
+
+.flashcard { display: grid; gap: 12px; padding: 20px; border: 1px solid #dbe6ee; border-radius: 14px; background: #fbfdff; }
+.flashcard h4 { margin: 0; font-size: 1.1rem; line-height: 1.4; }
+.flashcard-back { margin: 0; padding: 12px 14px; border-radius: 10px; background: #eef4f9; color: #33506a; line-height: 1.55; }
+.card-grades { flex-wrap: wrap; }
+
+/* --- Читалка --- */
+.reader-picker { display: grid; gap: 6px; min-width: 240px; font-size: .86rem; font-weight: 750; }
+.reader-toolbar { margin-top: 16px; }
+.reader-page { max-width: 68ch; margin: 18px 0; color: #23405a; font-size: 1.03rem; line-height: 1.75; }
+.reader-page p { margin: 0 0 1.1em; }
+.reader-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding-top: 12px; border-top: 1px solid var(--line); }
+.reader-actions button:first-child { margin-right: auto; }
+#reader-note-form { display: grid; gap: 10px; margin-top: 16px; padding: 16px; border: 1px solid var(--line); border-radius: 12px; background: #fbfdff; }
+#reader-note-form label { display: grid; gap: 6px; font-size: .86rem; font-weight: 750; }
+.note-row { padding: 14px; border: 1px solid #e5edf3; border-radius: 12px; background: #fbfdff; }
+.note-row p { margin: 8px 0 0; color: #33506a; line-height: 1.55; }
+.chip-button { padding: 7px 12px; border-radius: 999px; color: var(--blue); background: var(--blue-light); font-size: .82rem; font-weight: 780; }
+
+/* --- Прогресс --- */
+.stat-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-top: 16px; }
+.stat-tile { display: grid; gap: 4px; padding: 16px; border: 1px solid #e5edf3; border-radius: 12px; background: #fbfdff; }
+.stat-tile strong { color: var(--navy); font-size: 1.6rem; letter-spacing: -.03em; }
+.stat-tile span { color: var(--muted); font-size: .82rem; font-weight: 700; }
+.day-chart { display: flex; align-items: end; gap: 3px; height: 110px; margin-top: 12px; padding: 10px; border: 1px solid #e5edf3; border-radius: 12px; background: #fbfdff; }
+.day-chart span { flex: 1; min-width: 4px; border-radius: 3px 3px 0 0; background: linear-gradient(180deg, #4d95ca, #2b66a1); }
+.achievement { padding: 8px 13px; border: 1px solid #e0e9f0; border-radius: 999px; background: #f7fafc; color: var(--muted); font-size: .84rem; font-weight: 750; }
+.achievement.is-earned { border-color: #9fc9a9; color: #0f6b4c; background: #eef8f2; }
+
+@media (max-width: 720px) {
+  .plan-row, .lesson-row { align-items: stretch; flex-direction: column; }
+  .plan-row-actions, .lesson-row-side { justify-content: flex-start; }
+  .reader-actions button { flex: 1; }
+  .stat-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+#lesson-back { justify-self: start; margin-bottom: 14px; padding-left: 0; }
+.day-chart span { max-width: 26px; }
+/* День без занятий — светлая засечка, а не столбик: иначе пустой день читался
+   бы как небольшая активность. */
+.day-chart span[data-empty] { background: #dfe8ef; }

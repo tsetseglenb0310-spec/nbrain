@@ -16,7 +16,34 @@ import server
 DIM = 64
 
 
+def fake_generate(payload):
+    """Заглушка генерации занятия: возвращает разбираемый JSON нужной формы."""
+    fake_generate.calls += 1
+    data = {
+        "title": "Ясность в управлении",
+        "goal": "Понимать, зачем команде ясные ожидания",
+        "summary": "Первый абзац конспекта.\n\nВторой абзац конспекта.",
+        "key_ideas": [{"idea": "Ясность экономит время", "why": "Меньше переспрашивают", "page": 1},
+                      {"idea": "Ожидания проговариваются вслух", "why": "Иначе домысливают", "page": 99999}],
+        "terms": [{"term": "Ожидание", "meaning": "Что именно считается сделанным", "page": 1}],
+        "quotes": [{"text": "Управление командой требует ясности.", "page": 1}],
+        "practice": "Сформулируйте три ожидания к своей команде.",
+        "questions": [{"prompt": f"Вопрос {i + 1}", "options": ["А", "Б", "В", "Г"],
+                       "answer": i % 4, "explanation": "Так следует из текста.", "page": 1} for i in range(5)],
+        "flashcards": [{"front": f"Карточка {i + 1}", "back": "Краткий ответ", "page": 1} for i in range(6)],
+    }
+    # Модель нередко оборачивает JSON в текст — проверяем и этот случай тоже.
+    body = "Вот результат:\n```json\n" + json.dumps(data, ensure_ascii=False) + "\n```"
+    return {"output": [{"content": [{"type": "output_text", "text": body}]}]}
+
+
+fake_generate.calls = 0
+AID_ABSENT = "нет-такого-аккаунта"
+
+
 def fake_embed(path, payload):
+    if path == "responses":
+        return fake_generate(payload)
     assert path == "embeddings", path
     out = []
     for text in payload["input"]:
@@ -82,7 +109,12 @@ check("кириллический пароль принимается",
       server.verify_password("МойСложныйПароль-2026", OWNER["password_hash"], OWNER["password_salt"]))
 check("неверный пароль отклоняется",
       not server.verify_password("wrong", OWNER["password_hash"], OWNER["password_salt"]))
-check("у профиля владельца есть карточка", server.get_profile(UID)["name"] == server.DEFAULT_DIRECTOR_NAME)
+OWNER_PROFILE = server.get_profile(UID)
+check("у профиля владельца есть карточка", OWNER_PROFILE["name"] == OWNER["username"])
+check("в новом профиле нет чужого имени", server.SEEDED_PROFILE_NAME not in OWNER_PROFILE["name"])
+check("в новом профиле нет чужих сильных сторон", OWNER_PROFILE["strengths"] == [])
+check("в новом профиле нет чужих целей и фокуса",
+      OWNER_PROFILE["goals"] == "" and OWNER_PROFILE["focus"] == "")
 
 token = server.make_session_token(OWNER)
 check("свежая сессия валидна", server.session_is_valid(f"nbrain_session={token}"))
@@ -421,7 +453,7 @@ check("чужое действие нельзя закрыть",
 server.save_profile(AID, {"name": "Анна Иванова", "focus": "финансы"})
 check("профиль второго аккаунта сохраняется отдельно",
       server.get_profile(AID)["name"] == "Анна Иванова"
-      and server.get_profile(UID)["name"] == server.DEFAULT_DIRECTOR_NAME)
+      and server.get_profile(UID)["name"] == OWNER["username"])
 
 # Один и тот же каталожный ключ должен уживаться у двух владельцев.
 check("ключ каталога включает владельца",
@@ -606,6 +638,21 @@ check("пустые идентификаторы отбрасываются",
 check("одиночный book_id поддерживается", server.selected_book_ids({"book_id": "x"}) == ["x"])
 
 print("\n=== 19. Проверка конфигурации при старте ===")
+# Строгое сравнение с "1" однажды уже стоило рабочего сервиса: значение вроде
+# "true" читалось как «выключено», а для NBRAIN_AUTH_REQUIRED это означает
+# «пускать всех как администратора».
+for truthy in ("1", "true", "TRUE", " yes ", "on", "Y"):
+    os.environ["NBRAIN_TEST_FLAG"] = truthy
+    check(f"значение {truthy!r} читается как «да»", server.env_flag("NBRAIN_TEST_FLAG") is True)
+for falsy in ("0", "false", "No", " off ", ""):
+    os.environ["NBRAIN_TEST_FLAG"] = falsy
+    check(f"значение {falsy!r} читается как «нет»", server.env_flag("NBRAIN_TEST_FLAG", True) is False)
+os.environ["NBRAIN_TEST_FLAG"] = "может быть"
+check("непонятное значение не меняет умолчание", server.env_flag("NBRAIN_TEST_FLAG", True) is True)
+os.environ.pop("NBRAIN_TEST_FLAG")
+check("отсутствующая переменная берёт умолчание",
+      server.env_flag("NBRAIN_TEST_FLAG", True) is True and server.env_flag("NBRAIN_TEST_FLAG") is False)
+
 saved_auth, saved_host = server.AUTH_REQUIRED, server.HOST
 try:
     server.AUTH_REQUIRED = False
@@ -645,6 +692,249 @@ with server.db() as conn:
     books_live = conn.execute("SELECT COUNT(*) c FROM books").fetchone()["c"]
 check("копия содержит те же аккаунты", users_in_copy == users_live, f"({users_in_copy} vs {users_live})")
 check("копия содержит те же книги", books_in_copy == books_live, f"({books_in_copy} vs {books_live})")
+
+print("\n=== 21. Разбиение TXT на страницы ===")
+pages = server.paginate_plain_text("\n\n".join(f"Абзац {i}. " + "слово " * 100 for i in range(10)), words_per_page=250)
+check("длинный текст разбит на несколько страниц", len(pages) > 1, f"({len(pages)})")
+check("страницы нумеруются подряд с 1", [p for p, _ in pages] == list(range(1, len(pages) + 1)))
+check("абзац не разрезан посередине", all("Абзац" in text for _, text in pages))
+check("пустой текст не даёт страниц", server.paginate_plain_text("   ") == [])
+solo = server.paginate_plain_text("слово " * 900, words_per_page=100)
+check("абзац длиннее страницы остаётся целым", len(solo) == 1, f"({len(solo)})")
+
+print("\n=== 22. Читалка ===")
+reader_path = server.UPLOADS_DIR / "reader.txt"
+reader_path.write_text("\n\n".join(f"Абзац {i}. " + "Управление командой требует ясности. " * 25 for i in range(24)), encoding="utf-8")
+with server.db() as conn:
+    conn.execute(
+        "INSERT INTO books (id, user_id, filename, title, extension, stored_path, status, created_at) VALUES (?,?,?,?,?,?,'indexing',?)",
+        ("rb", UID, "reader.txt", "Управление", ".txt", str(reader_path), server.now_iso()),
+    )
+server.start_indexing("rb", reader_path)
+check("книга для чтения проиндексирована", wait_ready("rb")[0] == "ready")
+total_pages = server.ensure_pages_count("rb")
+check("страницы сохранены при индексации", total_pages > 3, f"({total_pages})")
+
+page = server.read_page(UID, "rb", 2)
+check("страница отдаётся с текстом и соседями",
+      page["page_no"] == 2 and page["content"] and page["prev_page"] == 1 and page["next_page"] == 3)
+check("оценка времени чтения не нулевая", page["minutes"] >= 1)
+check("номер за пределами книги приводится к последней",
+      server.read_page(UID, "rb", 10_000)["page_no"] == total_pages)
+check("чужая книга в читалке не открывается", raises(server.read_page, AID_ABSENT, "rb", 1))
+
+state = server.save_reading_progress(UID, {"book_id": "rb", "page_no": 3, "seconds": 90})
+check("позиция сохранена", state["page_no"] == 3)
+check("процент прочитанного посчитан", 0 < state["percent"] < 100, f"({state['percent']})")
+back = server.save_reading_progress(UID, {"book_id": "rb", "page_no": 1, "seconds": 5})
+check("возврат назад не сбрасывает максимум", back["furthest_page"] == 3, f"({back['furthest_page']})")
+check("минуты до конца книги уменьшились", back["minutes_left"] < state["total_words"])
+
+check("закладка ставится", server.toggle_bookmark(UID, {"book_id": "rb", "page_no": 2})["bookmarked"] is True)
+check("повторное нажатие снимает закладку", server.toggle_bookmark(UID, {"book_id": "rb", "page_no": 2})["bookmarked"] is False)
+note = server.save_note(UID, {"book_id": "rb", "page_no": 2, "quote": "ясности", "content": "обсудить с командой"})
+check("заметка привязана к странице", note["page_no"] == 2 and note["quote"] == "ясности")
+check("заметка видна на своей странице", len(server.read_page(UID, "rb", 2)["notes"]) == 1)
+check("пустая заметка отклоняется", raises(server.save_note, UID, {"book_id": "rb", "content": "   "}))
+check("удаление чужой заметки отклоняется", raises(server.delete_note, "нет-такого", note["id"]))
+check("своя заметка удаляется", server.delete_note(UID, note["id"])["deleted"])
+
+print("\n=== 23. План обучения ===")
+check("план по неготовой книге не строится", raises(server.build_learning_plan, UID, {"book_id": "b3"}))
+plan = server.build_learning_plan(UID, {"book_id": "rb", "daily_minutes": 15, "goal": "Навести порядок"})
+check("план создан с занятиями", plan["total_lessons"] >= 3, f"({plan['total_lessons']})")
+check("занятия идут подряд и без разрывов",
+      [lesson["ordinal"] for lesson in plan["lessons"]] == list(range(1, plan["total_lessons"] + 1)))
+covered = plan["lessons"][0]["page_from"] == 1 and plan["lessons"][-1]["page_to"] == total_pages
+check("занятия покрывают книгу от первой до последней страницы", covered,
+      f"({plan['lessons'][0]['page_from']}..{plan['lessons'][-1]['page_to']} из {total_pages})")
+check("диапазоны страниц не пересекаются",
+      all(plan["lessons"][i]["page_to"] < plan["lessons"][i + 1]["page_from"] for i in range(len(plan["lessons"]) - 1)))
+check("у каждого занятия есть дата", all(lesson["scheduled_for"] for lesson in plan["lessons"]))
+check("цель плана сохранена", plan["goal"] == "Навести порядок")
+
+big = server.build_learning_plan(UID, {"book_id": "rb", "daily_minutes": 120})
+check("при большем времени в день занятий не больше", big["total_lessons"] <= plan["total_lessons"],
+      f"({big['total_lessons']} против {plan['total_lessons']})")
+soon = (server.datetime.now(server.timezone.utc).date() + server.timedelta(days=2)).isoformat()
+tight = server.build_learning_plan(UID, {"book_id": "rb", "daily_minutes": 15, "target_date": soon})
+check("при близкой дате занятия укладываются в срок",
+      max(lesson["scheduled_for"] for lesson in tight["lessons"]) <= soon,
+      f"({max(l['scheduled_for'] for l in tight['lessons'])} > {soon})")
+check("прошедшая дата отклоняется",
+      raises(server.build_learning_plan, UID, {"book_id": "rb", "target_date": "2020-01-01"}))
+check("прежний план по той же книге заархивирован",
+      [item["id"] for item in server.list_learning_plans(UID)] == [tight["id"]])
+
+print("\n=== 24. Занятие, тест и карточки ===")
+lesson_id = tight["lessons"][0]["id"]
+before_calls = fake_embed.calls
+lesson = server.generate_lesson(UID, lesson_id)
+check("материал занятия сформирован", lesson["generated"] is True)
+check("конспект не пустой", bool(lesson["summary"]))
+check("есть пометка о вспомогательном материале", "не замена книги" in lesson["disclaimer"])
+check("вопросы созданы", len(lesson["questions"]) == 5, f"({len(lesson['questions'])})")
+check("правильный ответ не уходит клиенту", all("answer" not in q for q in lesson["questions"]))
+check("карточки созданы", lesson["flashcard_count"] == 6, f"({lesson['flashcard_count']})")
+check("ссылки на страницы не выходят за пределы занятия",
+      all(idea["page"] is None or lesson["page_from"] <= idea["page"] <= lesson["page_to"]
+          for idea in lesson["key_ideas"]))
+check("повторный вызов не создаёт материал заново",
+      server.generate_lesson(UID, lesson_id)["generated"] and fake_generate.calls == 1,
+      f"(вызовов генерации: {fake_generate.calls})")
+
+with server.db() as conn:
+    answers = {row["id"]: row["answer"] for row in conn.execute(
+        "SELECT id, answer FROM quiz_questions WHERE lesson_id = ?", (lesson_id,))}
+result = server.submit_quiz(UID, {"lesson_id": lesson_id, "answers": answers})
+check("все ответы верные дают 100%", result["score"] == 100 and result["passed"], f"({result['score']})")
+check("занятие отмечено пройденным", server.get_lesson(UID, lesson_id)["status"] == "done")
+wrong = {key: (value + 1) % 4 for key, value in answers.items()}
+bad = server.submit_quiz(UID, {"lesson_id": lesson_id, "answers": wrong})
+check("неверные ответы дают низкий балл", bad["score"] < 70, f"({bad['score']})")
+check("в разборе показан правильный ответ и объяснение",
+      all(item["answer"] is not None and item["explanation"] for item in bad["results"]))
+with server.db() as conn:
+    due_today = conn.execute(
+        "SELECT COUNT(*) c FROM flashcards WHERE user_id = ? AND lesson_id = ? AND due_on <= ?",
+        (UID, lesson_id, server.datetime.now(server.timezone.utc).date().isoformat())).fetchone()["c"]
+check("слабый результат возвращает карточки занятия на сегодня", due_today == 6, f"({due_today})")
+
+print("\n=== 25. Интервальное повторение ===")
+card = {"ease": 250, "repetitions": 0, "interval_days": 0, "lapses": 0}
+first = server.schedule_card(card, server.CARD_GRADES["good"])
+check("первое успешное повторение — через день", first[0] == 1, f"({first[0]})")
+second = server.schedule_card({"ease": first[1], "repetitions": first[2], "interval_days": first[0], "lapses": 0},
+                              server.CARD_GRADES["good"])
+check("второе — через шесть дней", second[0] == 6, f"({second[0]})")
+third = server.schedule_card({"ease": second[1], "repetitions": second[2], "interval_days": second[0], "lapses": 0},
+                             server.CARD_GRADES["good"])
+check("третье считается по коэффициенту лёгкости", third[0] > second[0], f"({third[0]})")
+forgotten = server.schedule_card({"ease": 250, "repetitions": 5, "interval_days": 40, "lapses": 1},
+                                 server.CARD_GRADES["again"])
+check("забытая карточка возвращается на сегодня", forgotten[0] == 0)
+check("забывание считается промахом", forgotten[3] == 2)
+check("лёгкость не падает ниже предела",
+      server.schedule_card({"ease": 130, "repetitions": 3, "interval_days": 10, "lapses": 0},
+                           server.CARD_GRADES["again"])[1] >= 130)
+check("интервал не превышает года",
+      server.schedule_card({"ease": 350, "repetitions": 12, "interval_days": 300, "lapses": 0},
+                           server.CARD_GRADES["easy"])[0] <= 365)
+cards = server.due_flashcards(UID)
+check("карточки к повторению отдаются", cards["due_total"] >= 6, f"({cards['due_total']})")
+graded = server.review_flashcard(UID, {"id": cards["cards"][0]["id"], "grade": "good"})
+check("после оценки назначена новая дата", graded["interval_days"] == 1)
+check("неизвестная оценка отклоняется",
+      raises(server.review_flashcard, UID, {"id": cards["cards"][0]["id"], "grade": "отлично"}))
+check("чужая карточка не оценивается",
+      raises(server.review_flashcard, "нет-такого", {"id": cards["cards"][0]["id"], "grade": "good"}))
+
+print("\n=== 26. Прогресс и статистика ===")
+dash = server.learning_dashboard(UID)
+check("минуты занятий посчитаны", dash["minutes_total"] > 0, f"({dash['minutes_total']})")
+check("пройденные занятия посчитаны", dash["lessons_done"] >= 1)
+check("средний балл посчитан", dash["average_score"] is not None)
+check("график содержит 30 дней", len(dash["minutes_by_day"]) == 30, f"({len(dash['minutes_by_day'])})")
+check("дни без занятий тоже в графике", any(day["minutes"] == 0 for day in dash["minutes_by_day"]))
+check("серия минимум один день", dash["streak"] >= 1)
+check("прогресс чтения виден", any(item["book_id"] == "rb" for item in dash["reading"]))
+check("достижения посчитаны", any(item["earned"] for item in dash["achievements"]))
+today = server.datetime.now(server.timezone.utc).date()
+check("серия из трёх дней подряд",
+      server.study_streak([(today - server.timedelta(days=n)).isoformat() for n in range(3)]) == 3)
+check("вчерашняя серия ещё жива",
+      server.study_streak([(today - server.timedelta(days=n)).isoformat() for n in (1, 2)]) == 2)
+check("разрыв обрывает серию",
+      server.study_streak([today.isoformat(), (today - server.timedelta(days=5)).isoformat()]) == 1)
+check("пустая история — нулевая серия", server.study_streak([]) == 0)
+
+print("\n=== 27. Изоляция учебных данных ===")
+OTHER = server.create_user({"username": "student", "password": "ПарольСтудента-2026"})
+OID = OTHER["id"]
+check("чужой план не открывается", raises(server.get_learning_plan, OID, tight["id"]))
+check("чужое занятие не открывается", raises(server.get_lesson, OID, lesson_id))
+check("чужое занятие не генерируется", raises(server.generate_lesson, OID, lesson_id))
+check("чужой тест не сдаётся", raises(server.submit_quiz, OID, {"lesson_id": lesson_id, "answers": {}}))
+check("чужие планы не видны", server.list_learning_plans(OID) == [])
+check("чужие карточки не видны", server.due_flashcards(OID)["total"] == 0)
+check("чужие заметки не видны", server.list_notes(OID) == [])
+check("чужая статистика пуста", server.learning_dashboard(OID)["minutes_total"] == 0)
+check("чужой прогресс чтения не сохраняется",
+      raises(server.save_reading_progress, OID, {"book_id": "rb", "page_no": 1}))
+server.purge_user(OID)
+
+print("\n=== 28. Чистый профиль нового аккаунта ===")
+FRESH = server.create_user({"username": "newcomer", "password": "ПарольНовичка-2026"})
+FRESH_ID = FRESH["id"]
+fresh_profile = server.get_profile(FRESH_ID)
+check("у нового аккаунта нет чужого имени", server.SEEDED_PROFILE_NAME not in fresh_profile["name"])
+check("у нового аккаунта пустые сильные стороны", fresh_profile["strengths"] == [])
+check("у нового аккаунта пустые цели и фокус",
+      fresh_profile["goals"] == "" and fresh_profile["focus"] == "")
+check("имя профиля берётся из самого аккаунта", fresh_profile["name"] == "newcomer")
+check("у нового аккаунта нет чужих книг и заметок",
+      server.list_books(FRESH_ID) == [] and server.list_notes(FRESH_ID) == []
+      and server.list_memories(FRESH_ID) == [] and server.list_actions(FRESH_ID) == [])
+
+# Очистка полей должна очищать данные, а не возвращать чужие значения.
+server.save_profile(FRESH_ID, {"name": "Ольга", "strengths": ["Strategic"], "goals": "цель", "focus": "фокус"})
+cleared = server.save_profile(FRESH_ID, {"name": "", "strengths": [], "goals": "", "focus": ""})
+check("очищенное имя остаётся пустым", cleared["name"] == "")
+check("очищенные сильные стороны остаются пустыми", cleared["strengths"] == [])
+check("очищенные цели и фокус остаются пустыми",
+      cleared["goals"] == "" and cleared["focus"] == "")
+check("для писем и экспорта берётся имя аккаунта, а не чужое",
+      server.profile_display_name(FRESH_ID) == "newcomer")
+
+# Имя в профиле и имя в шапке — одно и то же имя, редактируемое в одном месте.
+server.save_profile(FRESH_ID, {"name": "Цэцэглэн", "strengths": [], "goals": "", "focus": ""})
+with server.db() as conn:
+    renamed = dict(conn.execute(
+        "SELECT username, display_name FROM users WHERE id = ?", (FRESH_ID,)
+    ).fetchone())
+check("имя из профиля попадает в аккаунт", renamed["display_name"] == "Цэцэглэн")
+check("логин при этом не меняется", renamed["username"] == "newcomer")
+check("нелатинское имя доходит до писем и экспорта",
+      server.profile_display_name(FRESH_ID) == "Цэцэглэн")
+server.save_profile(FRESH_ID, {"name": "", "strengths": [], "goals": "", "focus": ""})
+with server.db() as conn:
+    emptied = dict(conn.execute(
+        "SELECT display_name FROM users WHERE id = ?", (FRESH_ID,)
+    ).fetchone())
+check("очистка имени возвращает логин, а не пустую шапку", emptied["display_name"] == "newcomer")
+
+# Миграция 004: старая база, засеянная чужими данными, должна очиститься,
+# но заполненный человеком профиль трогать нельзя.
+seeded_json = json.dumps(server.SEEDED_STRENGTHS, ensure_ascii=False)
+FILLED = server.create_user({"username": "filled", "password": "ПарольЗаполнен-2026"})
+with server.db() as conn:
+    for uid in (FRESH_ID, FILLED["id"]):
+        conn.execute(
+            "UPDATE director_profile SET name = ?, strengths_json = ?, goals = '', focus = '' WHERE user_id = ?",
+            (server.SEEDED_PROFILE_NAME, seeded_json, uid),
+        )
+        conn.execute("UPDATE users SET display_name = ? WHERE id = ?", (server.SEEDED_PROFILE_NAME, uid))
+    conn.execute(
+        "UPDATE director_profile SET name = 'Борис', goals = 'вырасти в роли', focus = 'финансы' WHERE user_id = ?",
+        (FILLED["id"],),
+    )
+    conn.execute("UPDATE users SET display_name = 'Борис' WHERE id = ?", (FILLED["id"],))
+    server.migrate_clean_seeded_profiles(conn)
+after_seeded = server.get_profile(FRESH_ID)
+after_filled = server.get_profile(FILLED["id"])
+check("миграция убирает чужое имя из нетронутого профиля",
+      after_seeded["name"] == "newcomer")
+check("миграция убирает чужие сильные стороны", after_seeded["strengths"] == [])
+check("миграция не трогает заполненный профиль",
+      after_filled["name"] == "Борис" and after_filled["goals"] == "вырасти в роли"
+      and after_filled["strengths"] == server.SEEDED_STRENGTHS)
+with server.db() as conn:
+    left = conn.execute(
+        "SELECT COUNT(*) AS n FROM users WHERE display_name = ?", (server.SEEDED_PROFILE_NAME,)
+    ).fetchone()["n"]
+check("после миграции чужого имени нет ни в одном аккаунте", left == 0)
+server.purge_user(FRESH_ID)
+server.purge_user(FILLED["id"])
 
 print("\n" + "=" * 54)
 print(f"ИТОГО: {OK} пройдено, {FAIL} провалено")

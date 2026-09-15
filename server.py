@@ -55,6 +55,19 @@ except ImportError:  # pragma: no cover - optional dependency
     _np = None
 
 
+# Python block-buffers stdout when it is a pipe rather than a terminal, which
+# is exactly the case under Docker and Render. Startup diagnostics — which
+# migrations ran, which port is bound, whether mail is configured — then sat in
+# the buffer and never reached the platform log, so a successful deploy looked
+# silent while a failing one was chatty (SystemExit writes to stderr, which is
+# not block-buffered). Line buffering makes both behave the same.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):  # pragma: no cover - already unbuffered
+        pass
+
+
 def _load_env_file(path: Path) -> None:
     """Populate os.environ from a simple .env file if present.
 
@@ -80,6 +93,29 @@ def _load_env_file(path: Path) -> None:
             os.environ.setdefault(key, value)
 
 
+def env_flag(name: str, default: bool = False) -> bool:
+    """Read a yes/no environment variable without being fussy about spelling.
+
+    This used to be a bare `os.environ.get(name, "0") == "1"`. That comparison
+    is exact, so `true`, `True`, `yes` or a value with a stray trailing space
+    all read as "off" — and for NBRAIN_AUTH_REQUIRED "off" means the service
+    serves everyone as the administrator without asking for a password. A
+    setting whose typo silently disables authentication is a bad setting, so
+    the accepted spellings are wide and anything unrecognised is announced in
+    the log rather than quietly treated as "off".
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().casefold()
+    if value in {"1", "true", "yes", "on", "y"}:
+        return True
+    if value in {"0", "false", "no", "off", "n", ""}:
+        return False
+    print(f"{name}={raw!r} is not a yes/no value; using {'yes' if default else 'no'}.", file=sys.stderr)
+    return default
+
+
 ROOT = Path(__file__).resolve().parent
 _load_env_file(ROOT / ".env")
 DATA_DIR = Path(os.environ.get("NBRAIN_DATA_DIR", ROOT / "data"))
@@ -92,17 +128,21 @@ HOST = os.environ.get("NBRAIN_HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", os.environ.get("NBRAIN_PORT", "8000")))
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-AUTH_REQUIRED = os.environ.get("NBRAIN_AUTH_REQUIRED", "0") == "1"
+AUTH_REQUIRED = env_flag("NBRAIN_AUTH_REQUIRED", False)
 # The first account is created from these on an empty database. Existing
 # installations keep the password they already had: it becomes the password of
 # the primary account, so nothing has to be re-entered after the upgrade.
 ADMIN_PASSWORD = os.environ.get("NBRAIN_ADMIN_PASSWORD", "")
 ADMIN_USERNAME = os.environ.get("NBRAIN_ADMIN_USERNAME", "admin")
+# The login has to be ASCII to stay typeable on any keyboard, but the name shown
+# in the interface does not. This one is only used when the account is created;
+# afterwards the owner changes it in the profile.
+ADMIN_DISPLAY_NAME = os.environ.get("NBRAIN_ADMIN_DISPLAY_NAME", "").strip()[:120]
 SESSION_SECRET = os.environ.get("NBRAIN_SESSION_SECRET", "")
 PASSWORD_ITERATIONS = int(os.environ.get("NBRAIN_PASSWORD_ITERATIONS", "200000"))
 MIN_PASSWORD_LENGTH = 8
 USERNAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,31}$")
-SECURE_COOKIES = os.environ.get("NBRAIN_SECURE_COOKIES", "0") == "1"
+SECURE_COOKIES = env_flag("NBRAIN_SECURE_COOKIES", False)
 ANSWER_MODEL = os.environ.get("NBRAIN_MODEL", "gpt-4o-mini")
 CLAUDE_MODEL = os.environ.get("NBRAIN_CLAUDE_MODEL", "claude-sonnet-4-6")
 EMBEDDING_MODEL = os.environ.get("NBRAIN_EMBEDDING_MODEL", "text-embedding-3-small")
@@ -141,7 +181,7 @@ LOGIN_MAX_TRACKED_CLIENTS = 4096
 # correct when the service is unreachable except through the platform's proxy
 # (Render, Fly, Cloud Run). Default: trust nothing, throttle by socket address.
 TRUSTED_PROXIES = {item.strip() for item in os.environ.get("NBRAIN_TRUSTED_PROXIES", "").split(",") if item.strip()}
-TRUST_FORWARDED_FOR = os.environ.get("NBRAIN_TRUST_FORWARDED_FOR", "0") == "1"
+TRUST_FORWARDED_FOR = env_flag("NBRAIN_TRUST_FORWARDED_FOR", False)
 # Public origin of the deployment. Used to build links in e-mails and to check
 # the Origin header of state-changing requests.
 PUBLIC_URL = os.environ.get("NBRAIN_PUBLIC_URL", "").rstrip("/")
@@ -156,7 +196,7 @@ SMTP_FROM = os.environ.get("NBRAIN_SMTP_FROM", "") or SMTP_USER
 SMTP_SECURITY = os.environ.get("NBRAIN_SMTP_SECURITY", "starttls").strip().lower()
 SMTP_TIMEOUT = float(os.environ.get("NBRAIN_SMTP_TIMEOUT", "20"))
 # Self-registration. Turning it off leaves account creation to administrators.
-REGISTRATION_OPEN = os.environ.get("NBRAIN_REGISTRATION_OPEN", "1") == "1"
+REGISTRATION_OPEN = env_flag("NBRAIN_REGISTRATION_OPEN", True)
 # Per-account quotas for the operations that cost money or CPU. Counted in a
 # sliding window inside the process; see RateLimiter.
 RATE_LIMITS = {
@@ -169,11 +209,19 @@ RATE_LIMITS = {
     "mail": (int(os.environ.get("NBRAIN_RATE_MAIL", "5")), 3600.0),
     "write": (int(os.environ.get("NBRAIN_RATE_WRITE", "300")), 3600.0),
 }
-DEFAULT_DIRECTOR_NAME = "Мухамед Чапанов"
-DEFAULT_STRENGTHS = [
+# NBrain started as a tool for one person, so his name and his CliftonStrengths
+# were written into every new profile. With open registration that meant a
+# stranger's data greeted each new account. There is no default profile any
+# more: it stays empty until its owner fills it in. Migration 004 clears the
+# profiles that were seeded before this change.
+SEEDED_PROFILE_NAME = "Мухамед Чапанов"
+SEEDED_STRENGTHS = [
     "Strategic", "Learner", "Achiever", "Ideation", "Analytical",
     "Futuristic", "Focus", "Arranger", "Individualization", "Belief",
 ]
+# Used only where a text has to address someone by name (prompts, exported
+# documents) and neither the profile nor the account carries one.
+ANONYMOUS_READER_NAME = "читатель"
 DEVELOPMENT_STATUSES = {"planned", "reading", "read", "implemented"}
 # Stable ids for the seeded interests: uuid5 keeps them identical on every
 # installation, so the same slug never gets two rows after a re-import.
@@ -605,10 +653,13 @@ def guard_startup_configuration() -> None:
             raise SystemExit("NBRAIN_SESSION_SECRET must be at least 32 characters long.")
         return
     if HOST not in LOOPBACK_HOSTS:
+        seen = os.environ.get("NBRAIN_AUTH_REQUIRED")
+        detail = "the variable is not set at all" if seen is None else f"NBRAIN_AUTH_REQUIRED is {seen!r}"
         raise SystemExit(
-            f"NBRAIN_AUTH_REQUIRED=0 leaves every request anonymous with administrator rights, "
-            f"so it is only allowed on loopback. Host is {HOST!r}: set NBRAIN_AUTH_REQUIRED=1 "
-            f"together with NBRAIN_ADMIN_PASSWORD and NBRAIN_SESSION_SECRET."
+            f"Without NBRAIN_AUTH_REQUIRED=1 every request counts as the administrator and needs "
+            f"no password, so that mode is only allowed on loopback. The socket is bound to "
+            f"{HOST!r} and {detail}. Set NBRAIN_AUTH_REQUIRED=1 together with "
+            f"NBRAIN_ADMIN_PASSWORD and NBRAIN_SESSION_SECRET (32 characters or more)."
         )
 
 
@@ -943,20 +994,215 @@ def migrate_accounts(conn: Any) -> None:
         )
 
 
+def migrate_learning(conn: Any) -> None:
+    """Tables for the learning loop: reading, plans, lessons, quizzes, cards.
+
+    Page text is stored separately from `chunks` even though both hold the same
+    words. Chunks overlap by design — that is what makes retrieval work — so
+    reading them in sequence would repeat a paragraph on every turn of the
+    page. The reader needs clean, non-overlapping pages; retrieval needs
+    overlapping windows. Two shapes of the same text, each fit for its job.
+    """
+    execute_script(
+        conn,
+        """
+        CREATE TABLE IF NOT EXISTS book_pages (
+            book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+            page_no INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            word_count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (book_id, page_no)
+        );
+
+        CREATE TABLE IF NOT EXISTS reading_progress (
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+            page_no INTEGER NOT NULL DEFAULT 1,
+            furthest_page INTEGER NOT NULL DEFAULT 1,
+            seconds_spent INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, book_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS bookmarks (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+            page_no INTEGER NOT NULL,
+            label TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            UNIQUE(user_id, book_id, page_no)
+        );
+
+        -- Distinct from `memories`, which are free-floating ideas. A note here
+        -- always points at a page, and usually at a quote from it.
+        CREATE TABLE IF NOT EXISTS notes (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+            page_no INTEGER,
+            quote TEXT NOT NULL DEFAULT '',
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_notes_user_book ON notes(user_id, book_id, page_no);
+
+        CREATE TABLE IF NOT EXISTS learning_plans (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+            title TEXT NOT NULL,
+            goal TEXT NOT NULL DEFAULT '',
+            daily_minutes INTEGER NOT NULL DEFAULT 20,
+            start_date TEXT NOT NULL,
+            target_date TEXT,
+            status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'done', 'archived')),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_learning_plans_user ON learning_plans(user_id, status);
+
+        CREATE TABLE IF NOT EXISTS lessons (
+            id TEXT PRIMARY KEY,
+            plan_id TEXT NOT NULL REFERENCES learning_plans(id) ON DELETE CASCADE,
+            ordinal INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            goal TEXT NOT NULL DEFAULT '',
+            page_from INTEGER NOT NULL,
+            page_to INTEGER NOT NULL,
+            estimated_minutes INTEGER NOT NULL DEFAULT 20,
+            scheduled_for TEXT,
+            status TEXT NOT NULL DEFAULT 'planned' CHECK (status IN ('planned', 'in_progress', 'done')),
+            summary TEXT NOT NULL DEFAULT '',
+            key_ideas_json TEXT NOT NULL DEFAULT '[]',
+            terms_json TEXT NOT NULL DEFAULT '[]',
+            quotes_json TEXT NOT NULL DEFAULT '[]',
+            practice TEXT NOT NULL DEFAULT '',
+            generated_at TEXT,
+            completed_at TEXT,
+            score INTEGER,
+            UNIQUE(plan_id, ordinal)
+        );
+        CREATE INDEX IF NOT EXISTS idx_lessons_plan ON lessons(plan_id, ordinal);
+        CREATE INDEX IF NOT EXISTS idx_lessons_scheduled ON lessons(scheduled_for, status);
+
+        CREATE TABLE IF NOT EXISTS quiz_questions (
+            id TEXT PRIMARY KEY,
+            lesson_id TEXT NOT NULL REFERENCES lessons(id) ON DELETE CASCADE,
+            ordinal INTEGER NOT NULL,
+            prompt TEXT NOT NULL,
+            options_json TEXT NOT NULL,
+            answer INTEGER NOT NULL,
+            explanation TEXT NOT NULL DEFAULT '',
+            source_pages TEXT NOT NULL DEFAULT '',
+            UNIQUE(lesson_id, ordinal)
+        );
+
+        -- Spaced repetition state lives on the card itself: one row is the
+        -- whole history the scheduler needs, so a review is a single update.
+        CREATE TABLE IF NOT EXISTS flashcards (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            book_id TEXT REFERENCES books(id) ON DELETE CASCADE,
+            lesson_id TEXT REFERENCES lessons(id) ON DELETE SET NULL,
+            front TEXT NOT NULL,
+            back TEXT NOT NULL,
+            source_pages TEXT NOT NULL DEFAULT '',
+            due_on TEXT NOT NULL,
+            interval_days INTEGER NOT NULL DEFAULT 0,
+            ease INTEGER NOT NULL DEFAULT 250,
+            repetitions INTEGER NOT NULL DEFAULT 0,
+            lapses INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_flashcards_due ON flashcards(user_id, due_on);
+
+        CREATE TABLE IF NOT EXISTS study_sessions (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL CHECK (kind IN ('reading', 'lesson', 'quiz', 'flashcards')),
+            book_id TEXT,
+            lesson_id TEXT,
+            minutes INTEGER NOT NULL DEFAULT 0,
+            score INTEGER,
+            day TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_study_sessions_user_day ON study_sessions(user_id, day);
+        """
+    )
+
+
+def migrate_clean_seeded_profiles(conn: Any) -> None:
+    """Erase the profile data that older versions wrote into every account.
+
+    Only untouched profiles are cleared: the strengths must still be exactly the
+    seeded list, and goals and focus must both be empty. A person who really
+    typed those ten CliftonStrengths would almost certainly have written a goal
+    or a focus too, so a profile with any of that survives intact.
+
+    The seeded name is removed the same way and replaced by the account's own
+    name, so nobody is greeted by a stranger.
+    """
+    seeded = json.dumps(SEEDED_STRENGTHS, ensure_ascii=False)
+    rows = conn.execute(
+        """SELECT p.user_id, p.name, p.strengths_json, u.display_name, u.username
+           FROM director_profile AS p JOIN users AS u ON u.id = p.user_id
+           WHERE p.goals = '' AND p.focus = ''"""
+    ).fetchall()
+    cleared = 0
+    for row in rows:
+        untouched_strengths = False
+        try:
+            untouched_strengths = json.loads(row["strengths_json"]) == SEEDED_STRENGTHS
+        except (TypeError, ValueError):
+            untouched_strengths = row["strengths_json"] == seeded
+        seeded_name = str(row["name"] or "").strip() == SEEDED_PROFILE_NAME
+        if not untouched_strengths and not seeded_name:
+            continue
+        name = str(row["name"] or "").strip()
+        if seeded_name:
+            account = str(row["display_name"] or "").strip()
+            if account == SEEDED_PROFILE_NAME:
+                account = str(row["username"] or "").strip()
+            name = account
+        conn.execute(
+            "UPDATE director_profile SET name = ?, strengths_json = ?, updated_at = ? WHERE user_id = ?",
+            (name, "[]" if untouched_strengths else row["strengths_json"], now_iso(), row["user_id"]),
+        )
+        cleared += 1
+    conn.execute(
+        "UPDATE users SET display_name = username WHERE display_name = ?",
+        (SEEDED_PROFILE_NAME,),
+    )
+    if cleared:
+        print(f"Cleared {cleared} seeded profile(s).")
+
+
 # Ordered, applied once, recorded in schema_migrations. Never edit a step that
 # has already shipped: add a new one instead, or an installation that already
 # ran the old version will never see the change.
 MIGRATIONS: list[tuple[str, Any]] = [
     ("001_multi_user", migrate_to_multi_user),
     ("002_accounts", migrate_accounts),
+    ("003_learning", migrate_learning),
+    ("004_clean_seeded_profiles", migrate_clean_seeded_profiles),
 ]
 
 
 def ensure_profile(conn: Any, user_id: str, name: str) -> None:
+    """Create an empty profile for an account.
+
+    Nothing is invented here. The name is what the person gave at registration
+    (or the login derived from the address); strengths, goals and focus start
+    empty so that the profile screen asks instead of asserting.
+    """
     conn.execute(
         """INSERT OR IGNORE INTO director_profile (user_id, name, strengths_json, goals, focus, updated_at)
-           VALUES (?, ?, ?, '', '', ?)""",
-        (user_id, name or DEFAULT_DIRECTOR_NAME, json.dumps(DEFAULT_STRENGTHS, ensure_ascii=False), now_iso()),
+           VALUES (?, ?, '[]', '', '', ?)""",
+        (user_id, (name or "").strip()[:120], now_iso()),
     )
 
 
@@ -979,7 +1225,7 @@ def bootstrap_primary_user(conn: Any) -> str:
     conn.execute(
         """INSERT INTO users (id, username, display_name, password_hash, password_salt, is_admin, created_at)
            VALUES (?, ?, ?, ?, ?, 1, ?)""",
-        (user_id, username, DEFAULT_DIRECTOR_NAME, password_hash, salt, now_iso()),
+        (user_id, username, ADMIN_DISPLAY_NAME or username, password_hash, salt, now_iso()),
     )
     print(f"Created the primary NBrain account «{username}».")
     return user_id
@@ -1781,12 +2027,42 @@ def read_pdf(path: Path) -> list[tuple[int, str]]:
     return pages
 
 
+TXT_WORDS_PER_PAGE = 400
+
+
+def paginate_plain_text(text: str, words_per_page: int = TXT_WORDS_PER_PAGE) -> list[tuple[int, str]]:
+    """Cut a flat text file into pages at paragraph boundaries.
+
+    A TXT file has no pages of its own, and treating the whole book as page one
+    made every citation read "стр. 1" and gave the reader one endless page.
+    Breaks land between paragraphs, so nothing is cut mid-sentence.
+    """
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
+    if not paragraphs:
+        return []
+    pages: list[tuple[int, str]] = []
+    current: list[str] = []
+    words = 0
+    for paragraph in paragraphs:
+        length = len(paragraph.split())
+        # A paragraph longer than a page becomes its own page rather than being
+        # split: keeping it whole matters more than making the pages even.
+        if current and words + length > words_per_page:
+            pages.append((len(pages) + 1, "\n\n".join(current)))
+            current, words = [], 0
+        current.append(paragraph)
+        words += length
+    if current:
+        pages.append((len(pages) + 1, "\n\n".join(current)))
+    return pages
+
+
 def read_txt(path: Path) -> list[tuple[int, str]]:
     raw = path.read_bytes()
     for encoding in ("utf-8", "utf-8-sig", "cp1251", "latin-1"):
         try:
-            text = raw.decode(encoding)
-            return [(1, normalize_text(text))]
+            text = normalize_text(raw.decode(encoding))
+            return paginate_plain_text(text) or [(1, text)]
         except UnicodeDecodeError:
             continue
     raise ClientError("Не удалось определить кодировку TXT-файла.")
@@ -2067,6 +2343,10 @@ def index_book(book_id: str, path: Path) -> dict[str, int]:
     chunks = make_chunks(pages)
     vectors = embed_many([chunk["content"] for chunk in chunks])
     with db() as conn:
+        # The reader needs the pages as they were, without the overlap that
+        # makes chunks good for retrieval. Stored in the same transaction so a
+        # book is never half-indexed and half-readable.
+        store_book_pages(conn, book_id, pages)
         conn.execute("DELETE FROM chunks WHERE book_id = ?", (book_id,))
         conn.executemany(
             """
@@ -2566,26 +2846,47 @@ def get_profile(user_id: str) -> dict[str, Any]:
             (user_id,),
         ).fetchone()
     if not row:  # pragma: no cover - init_storage always creates the profile
-        return {"name": DEFAULT_DIRECTOR_NAME, "strengths": DEFAULT_STRENGTHS, "goals": "", "focus": ""}
+        return {"name": "", "strengths": [], "goals": "", "focus": ""}
     profile = dict(row)
     profile["strengths"] = json.loads(profile.pop("strengths_json"))
     return profile
 
 
+def profile_display_name(user_id: str, profile: dict[str, Any] | None = None) -> str:
+    """A name to address the reader by in prompts and exported documents.
+
+    Falls back from the profile name to the account name, then to a neutral
+    word. It never falls back to another person's name.
+    """
+    profile = profile if profile is not None else get_profile(user_id)
+    name = str(profile.get("name") or "").strip()
+    if name:
+        return name
+    with db() as conn:
+        row = conn.execute(
+            "SELECT display_name, username FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+    if row:
+        account = str(row["display_name"] or row["username"] or "").strip()
+        if account:
+            return account
+    return ANONYMOUS_READER_NAME
+
+
 def save_profile(user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-    name = str(payload.get("name", DEFAULT_DIRECTOR_NAME)).strip()[:120] or DEFAULT_DIRECTOR_NAME
+    name = str(payload.get("name", "")).strip()[:120]
     goals = str(payload.get("goals", "")).strip()[:4000]
     focus = str(payload.get("focus", "")).strip()[:1000]
     raw_strengths = payload.get("strengths", [])
     if not isinstance(raw_strengths, list):
-        raise ClientError("CliftonStrengths должны быть переданы списком.")
+        raise ClientError("Сильные стороны должны быть переданы списком.")
     strengths = []
     for item in raw_strengths:
         strength = str(item).strip()[:80]
         if strength and strength not in strengths:
             strengths.append(strength)
-    if not strengths:
-        strengths = DEFAULT_STRENGTHS
+    # An empty list is a valid answer: clearing the field must clear the data,
+    # not quietly restore a default that belongs to someone else.
     with db() as conn:
         ensure_profile(conn, user_id, name)
         conn.execute(
@@ -2593,6 +2894,13 @@ def save_profile(user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
                SET name = ?, strengths_json = ?, goals = ?, focus = ?, updated_at = ?
                WHERE user_id = ?""",
             (name, json.dumps(strengths, ensure_ascii=False), goals, focus, now_iso(), user_id),
+        )
+        # One name, edited in one place. Without this the profile said one thing
+        # and the chip in the header kept showing the login, and there was no
+        # screen anywhere that could change the second one.
+        conn.execute(
+            "UPDATE users SET display_name = COALESCE(NULLIF(?, ''), username) WHERE id = ?",
+            (name, user_id),
         )
     return get_profile(user_id)
 
@@ -2666,6 +2974,1078 @@ def complete_action(user_id: str, action_id: str) -> dict[str, Any]:
     if not updated:
         raise ClientError("Открытое действие не найдено.")
     return {"id": action_id, "status": "done"}
+
+
+# --------------------------------------------------------------------------
+# Reading: pages, position, bookmarks, notes
+# --------------------------------------------------------------------------
+
+READING_WORDS_PER_MINUTE = int(os.environ.get("NBRAIN_READING_WPM", "200"))
+MAX_NOTE_CHARS = 4000
+MAX_QUOTE_CHARS = 1000
+
+
+def owned_book(user_id: str, book_id: str) -> dict[str, Any]:
+    """Fetch a book that belongs to this account, or refuse.
+
+    Every reading and learning endpoint starts here, so an id copied from
+    somebody else's library fails the same way a made-up one does.
+    """
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM books WHERE id = ? AND user_id = ?", (str(book_id).strip(), user_id)
+        ).fetchone()
+    if not row:
+        raise ClientError("Книга не найдена.")
+    return dict(row)
+
+
+def store_book_pages(conn: Any, book_id: str, pages: list[tuple[int, str]]) -> None:
+    conn.execute("DELETE FROM book_pages WHERE book_id = ?", (book_id,))
+    conn.executemany(
+        "INSERT INTO book_pages (book_id, page_no, content, word_count) VALUES (?, ?, ?, ?)",
+        [(book_id, page_no, text, len(text.split())) for page_no, text in pages if text.strip()],
+    )
+
+
+def ensure_book_pages(book: dict[str, Any]) -> int:
+    """Return the page count, extracting the text once if it is not stored yet.
+
+    Books indexed before the reader existed have chunks but no pages. Rather
+    than force a reindex — which would cost another round of embeddings — the
+    text is extracted from the file the first time someone opens the book and
+    kept from then on.
+    """
+    book_id = str(book["id"])
+    with db() as conn:
+        total = conn.execute(
+            "SELECT COUNT(*) AS total FROM book_pages WHERE book_id = ?", (book_id,)
+        ).fetchone()["total"]
+    if total:
+        return int(total)
+    path = Path(str(book["stored_path"]))
+    if not path.exists():
+        raise ClientError("Исходный файл книги не найден на диске. Загрузите книгу заново.")
+    pages = extract_pages(path)
+    with db() as conn:
+        store_book_pages(conn, book_id, pages)
+        total = conn.execute(
+            "SELECT COUNT(*) AS total FROM book_pages WHERE book_id = ?", (book_id,)
+        ).fetchone()["total"]
+    return int(total)
+
+
+def read_page(user_id: str, book_id: str, page_no: int) -> dict[str, Any]:
+    book = owned_book(user_id, book_id)
+    total = ensure_book_pages(book)
+    if not total:
+        raise ClientError("В книге не нашлось читаемого текста.")
+    page_no = max(1, min(int(page_no or 1), total))
+    with db() as conn:
+        row = conn.execute(
+            "SELECT page_no, content, word_count FROM book_pages WHERE book_id = ? AND page_no = ?",
+            (book["id"], page_no),
+        ).fetchone()
+        if not row:
+            # Extraction skips empty pages, so a gap in numbering is normal;
+            # step to the next page that actually has text.
+            row = conn.execute(
+                """SELECT page_no, content, word_count FROM book_pages
+                   WHERE book_id = ? AND page_no >= ? ORDER BY page_no LIMIT 1""",
+                (book["id"], page_no),
+            ).fetchone()
+        if not row:
+            raise ClientError("Такой страницы в книге нет.")
+        neighbours = conn.execute(
+            """SELECT
+                   (SELECT MAX(page_no) FROM book_pages WHERE book_id = ? AND page_no < ?) AS prev,
+                   (SELECT MIN(page_no) FROM book_pages WHERE book_id = ? AND page_no > ?) AS next""",
+            (book["id"], row["page_no"], book["id"], row["page_no"]),
+        ).fetchone()
+        bookmarked = conn.execute(
+            "SELECT 1 FROM bookmarks WHERE user_id = ? AND book_id = ? AND page_no = ?",
+            (user_id, book["id"], row["page_no"]),
+        ).fetchone() is not None
+        notes = [dict(item) for item in conn.execute(
+            """SELECT id, page_no, quote, content, created_at FROM notes
+               WHERE user_id = ? AND book_id = ? AND page_no = ? ORDER BY created_at""",
+            (user_id, book["id"], row["page_no"]),
+        ).fetchall()]
+    return {
+        "book": {"id": book["id"], "title": book["title"], "status": book["status"]},
+        "page_no": row["page_no"],
+        "content": row["content"],
+        "word_count": row["word_count"],
+        "minutes": max(1, round(row["word_count"] / max(1, READING_WORDS_PER_MINUTE))),
+        "total_pages": total,
+        "prev_page": neighbours["prev"],
+        "next_page": neighbours["next"],
+        "bookmarked": bookmarked,
+        "notes": notes,
+    }
+
+
+def reading_state(user_id: str, book_id: str) -> dict[str, Any]:
+    book = owned_book(user_id, book_id)
+    total = ensure_book_pages(book)
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM reading_progress WHERE user_id = ? AND book_id = ?", (user_id, book["id"])
+        ).fetchone()
+        pages = conn.execute(
+            "SELECT MIN(page_no) AS first, SUM(word_count) AS words FROM book_pages WHERE book_id = ?",
+            (book["id"],),
+        ).fetchone()
+        bookmarks = [dict(item) for item in conn.execute(
+            """SELECT id, page_no, label, created_at FROM bookmarks
+               WHERE user_id = ? AND book_id = ? ORDER BY page_no""",
+            (user_id, book["id"]),
+        ).fetchall()]
+    first_page = int(pages["first"] or 1)
+    furthest = int(row["furthest_page"]) if row else first_page
+    return {
+        "book": {"id": book["id"], "title": book["title"]},
+        "page_no": int(row["page_no"]) if row else first_page,
+        "furthest_page": furthest,
+        "total_pages": total,
+        "percent": reading_percent(book["id"], furthest, total),
+        "total_words": int(pages["words"] or 0),
+        "minutes_left": minutes_left(book["id"], furthest),
+        "seconds_spent": int(row["seconds_spent"]) if row else 0,
+        "bookmarks": bookmarks,
+    }
+
+
+def reading_percent(book_id: str, furthest_page: int, total_pages: int) -> int:
+    """Share of the book already reached, counted in pages that hold text."""
+    if not total_pages:
+        return 0
+    with db() as conn:
+        seen = conn.execute(
+            "SELECT COUNT(*) AS total FROM book_pages WHERE book_id = ? AND page_no <= ?",
+            (book_id, furthest_page),
+        ).fetchone()["total"]
+    return max(0, min(100, round(100 * int(seen) / total_pages)))
+
+
+def minutes_left(book_id: str, furthest_page: int) -> int:
+    with db() as conn:
+        words = conn.execute(
+            "SELECT COALESCE(SUM(word_count), 0) AS words FROM book_pages WHERE book_id = ? AND page_no > ?",
+            (book_id, furthest_page),
+        ).fetchone()["words"]
+    return max(0, round(int(words) / max(1, READING_WORDS_PER_MINUTE)))
+
+
+def save_reading_progress(user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    book = owned_book(user_id, str(payload.get("book_id", "")))
+    total = ensure_book_pages(book)
+    try:
+        page_no = max(1, min(int(payload.get("page_no", 1)), max(1, total)))
+        seconds = max(0, min(int(payload.get("seconds", 0)), 3600))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ClientError("Страница и время должны быть числами.") from exc
+    stamp = now_iso()
+    with db() as conn:
+        conn.execute(
+            """INSERT INTO reading_progress (user_id, book_id, page_no, furthest_page, seconds_spent, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(user_id, book_id) DO UPDATE SET
+                   page_no = excluded.page_no,
+                   -- furthest_page only ever moves forward: flipping back to
+                   -- re-read a page must not undo the progress bar.
+                   furthest_page = MAX(reading_progress.furthest_page, excluded.furthest_page),
+                   seconds_spent = reading_progress.seconds_spent + excluded.seconds_spent,
+                   updated_at = excluded.updated_at""",
+            (user_id, book["id"], page_no, page_no, seconds, stamp),
+        )
+    if seconds >= 30:
+        record_study_session(user_id, "reading", minutes=round(seconds / 60), book_id=book["id"])
+    return reading_state(user_id, book["id"])
+
+
+def toggle_bookmark(user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    book = owned_book(user_id, str(payload.get("book_id", "")))
+    try:
+        page_no = max(1, int(payload.get("page_no", 1)))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ClientError("Страница должна быть числом.") from exc
+    label = str(payload.get("label", "")).strip()[:200]
+    with db() as conn:
+        existing = conn.execute(
+            "SELECT id FROM bookmarks WHERE user_id = ? AND book_id = ? AND page_no = ?",
+            (user_id, book["id"], page_no),
+        ).fetchone()
+        if existing:
+            conn.execute("DELETE FROM bookmarks WHERE id = ?", (existing["id"],))
+            return {"bookmarked": False, "page_no": page_no}
+        conn.execute(
+            "INSERT INTO bookmarks (id, user_id, book_id, page_no, label, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (str(uuid.uuid4()), user_id, book["id"], page_no, label, now_iso()),
+        )
+    return {"bookmarked": True, "page_no": page_no}
+
+
+def list_notes(user_id: str, book_id: str | None = None) -> list[dict[str, Any]]:
+    sql = """SELECT notes.id, notes.book_id, notes.page_no, notes.quote, notes.content,
+                    notes.created_at, books.title AS book_title
+             FROM notes JOIN books ON books.id = notes.book_id
+             WHERE notes.user_id = ?"""
+    params: list[Any] = [user_id]
+    if book_id:
+        sql += " AND notes.book_id = ?"
+        params.append(str(book_id).strip())
+    sql += " ORDER BY notes.created_at DESC LIMIT 200"
+    with db() as conn:
+        return [dict(row) for row in conn.execute(sql, tuple(params)).fetchall()]
+
+
+def save_note(user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    book = owned_book(user_id, str(payload.get("book_id", "")))
+    content = bounded_text(payload.get("content", ""), MAX_NOTE_CHARS, "Заметка")
+    if not content:
+        raise ClientError("Нельзя сохранить пустую заметку.")
+    quote = bounded_text(payload.get("quote", ""), MAX_QUOTE_CHARS, "Цитата")
+    page_no = payload.get("page_no")
+    try:
+        page_no = int(page_no) if page_no not in (None, "") else None
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ClientError("Страница должна быть числом.") from exc
+    note = {
+        "id": str(uuid.uuid4()), "book_id": book["id"], "page_no": page_no,
+        "quote": quote, "content": content, "created_at": now_iso(),
+    }
+    with db() as conn:
+        conn.execute(
+            """INSERT INTO notes (id, user_id, book_id, page_no, quote, content, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (note["id"], user_id, book["id"], page_no, quote, content, note["created_at"], note["created_at"]),
+        )
+    return note
+
+
+def delete_note(user_id: str, note_id: str) -> dict[str, Any]:
+    with db() as conn:
+        deleted = conn.execute(
+            "DELETE FROM notes WHERE id = ? AND user_id = ?", (str(note_id).strip(), user_id)
+        ).rowcount
+    if not deleted:
+        raise ClientError("Заметка не найдена.")
+    return {"id": note_id, "deleted": True}
+
+
+# --------------------------------------------------------------------------
+# Learning plans
+# --------------------------------------------------------------------------
+
+MIN_LESSONS = 3
+MAX_LESSONS = 60
+# Reading the pages is only part of a lesson; the summary, the self-check and
+# the cards take time too. The share below is what goes to reading itself.
+LESSON_READING_SHARE = 0.6
+
+
+def record_study_session(user_id: str, kind: str, *, minutes: int = 0, score: int | None = None,
+                         book_id: str | None = None, lesson_id: str | None = None) -> None:
+    stamp = datetime.now(timezone.utc)
+    with db() as conn:
+        conn.execute(
+            """INSERT INTO study_sessions (id, user_id, kind, book_id, lesson_id, minutes, score, day, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (str(uuid.uuid4()), user_id, kind, book_id, lesson_id, max(0, int(minutes)),
+             score, stamp.date().isoformat(), stamp.isoformat()),
+        )
+
+
+def split_pages_into_lessons(pages: list[sqlite3.Row], words_per_lesson: int) -> list[tuple[int, int, int]]:
+    """Cut the page list into consecutive stretches of roughly equal length.
+
+    Splitting by page count would make lessons wildly uneven — a page of
+    dialogue and a page of dense prose are not the same amount of work — so the
+    unit is words. A page is never split across two lessons: stopping mid-page
+    would make both the reading and the page references confusing.
+    """
+    lessons: list[tuple[int, int, int]] = []
+    start = end = None
+    words = 0
+    for page in pages:
+        if start is None:
+            start = int(page["page_no"])
+        end = int(page["page_no"])
+        words += int(page["word_count"])
+        if words >= words_per_lesson:
+            lessons.append((start, end, words))
+            start = end = None
+            words = 0
+    if start is not None:
+        if lessons and words < words_per_lesson * 0.4:
+            # A stub of a final lesson reads as an accident; fold it into the
+            # previous one instead.
+            previous_start, _, previous_words = lessons[-1]
+            lessons[-1] = (previous_start, end, previous_words + words)
+        else:
+            lessons.append((start, end, words))
+    return lessons
+
+
+def build_learning_plan(user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Turn a book plus the person's available time into a dated schedule.
+
+    Nothing here is invented: the split follows the real length of the pages,
+    and the calendar follows the minutes a day the person said they have. The
+    content of each lesson is generated later, from the text of its own pages.
+    """
+    book = owned_book(user_id, str(payload.get("book_id", "")))
+    if book["status"] != "ready":
+        raise ClientError("Книга ещё не готова: дождитесь окончания индексации.")
+    ensure_book_pages(book)
+    profile = get_learning_profile(user_id)
+    try:
+        daily_minutes = int(payload.get("daily_minutes") or profile["daily_minutes"])
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ClientError("Минуты в день должны быть числом.") from exc
+    if not MIN_DAILY_MINUTES <= daily_minutes <= MAX_DAILY_MINUTES:
+        raise ClientError(f"Занятие в день: от {MIN_DAILY_MINUTES} до {MAX_DAILY_MINUTES} минут.")
+    target_date = parse_target_date(payload.get("target_date") or profile.get("target_date"))
+    goal = bounded_text(payload.get("goal", ""), 500, "Цель")
+
+    with db() as conn:
+        pages = conn.execute(
+            "SELECT page_no, word_count FROM book_pages WHERE book_id = ? ORDER BY page_no", (book["id"],)
+        ).fetchall()
+    if not pages:
+        raise ClientError("В книге не нашлось читаемого текста, план построить не из чего.")
+    total_words = sum(int(page["word_count"]) for page in pages)
+    reading_minutes = max(1, round(total_words / max(1, READING_WORDS_PER_MINUTE)))
+
+    words_per_lesson = max(150, round(daily_minutes * LESSON_READING_SHARE * READING_WORDS_PER_MINUTE))
+    ranges = split_pages_into_lessons(pages, words_per_lesson)
+    if len(ranges) > MAX_LESSONS:
+        # Very long book, very short daily budget: rather than schedule a year
+        # of lessons, make each one bigger and say so in the estimate.
+        words_per_lesson = math.ceil(total_words / MAX_LESSONS)
+        ranges = split_pages_into_lessons(pages, words_per_lesson)
+    if len(ranges) < MIN_LESSONS and total_words > 600:
+        words_per_lesson = math.ceil(total_words / MIN_LESSONS)
+        ranges = split_pages_into_lessons(pages, words_per_lesson)
+
+    start = datetime.now(timezone.utc).date()
+    days_available = None
+    if target_date:
+        days_available = (datetime.strptime(target_date, "%Y-%m-%d").date() - start).days + 1
+        if days_available < 1:
+            raise ClientError("Целевая дата уже прошла. Выберите дату в будущем.")
+    # One lesson a day by default; if the deadline is nearer than that, lessons
+    # bunch up and the interface says how many fall on one day.
+    step = 1.0
+    if days_available and len(ranges) > days_available:
+        step = days_available / len(ranges)
+
+    plan_id = str(uuid.uuid4())
+    stamp = now_iso()
+    lessons = []
+    for index, (page_from, page_to, words) in enumerate(ranges):
+        scheduled = start + timedelta(days=int(index * step))
+        if days_available:
+            scheduled = min(scheduled, start + timedelta(days=days_available - 1))
+        lessons.append({
+            "id": str(uuid.uuid4()),
+            "ordinal": index + 1,
+            "title": f"Занятие {index + 1}: страницы {page_from}–{page_to}",
+            "page_from": page_from,
+            "page_to": page_to,
+            "estimated_minutes": max(5, round(words / max(1, READING_WORDS_PER_MINUTE) / LESSON_READING_SHARE)),
+            "scheduled_for": scheduled.isoformat(),
+        })
+
+    with db() as conn:
+        conn.execute("UPDATE learning_plans SET status = 'archived', updated_at = ? WHERE user_id = ? AND book_id = ? AND status = 'active'",
+                     (stamp, user_id, book["id"]))
+        conn.execute(
+            """INSERT INTO learning_plans (id, user_id, book_id, title, goal, daily_minutes,
+                                           start_date, target_date, status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
+            (plan_id, user_id, book["id"], f"План по книге «{book['title']}»", goal,
+             daily_minutes, start.isoformat(), target_date, stamp, stamp),
+        )
+        conn.executemany(
+            """INSERT INTO lessons (id, plan_id, ordinal, title, goal, page_from, page_to,
+                                    estimated_minutes, scheduled_for)
+               VALUES (?, ?, ?, ?, '', ?, ?, ?, ?)""",
+            [(lesson["id"], plan_id, lesson["ordinal"], lesson["title"], lesson["page_from"],
+              lesson["page_to"], lesson["estimated_minutes"], lesson["scheduled_for"]) for lesson in lessons],
+        )
+    print(f"Plan {plan_id}: {len(lessons)} lessons over {book['title']!r} ({reading_minutes} min of reading)")
+    return get_learning_plan(user_id, plan_id)
+
+
+def get_learning_plan(user_id: str, plan_id: str) -> dict[str, Any]:
+    with db() as conn:
+        plan = conn.execute(
+            """SELECT learning_plans.*, books.title AS book_title, books.status AS book_status
+               FROM learning_plans JOIN books ON books.id = learning_plans.book_id
+               WHERE learning_plans.id = ? AND learning_plans.user_id = ?""",
+            (str(plan_id).strip(), user_id),
+        ).fetchone()
+        if not plan:
+            raise ClientError("План не найден.")
+        lessons = [dict(row) for row in conn.execute(
+            """SELECT id, ordinal, title, goal, page_from, page_to, estimated_minutes,
+                      scheduled_for, status, score, generated_at, completed_at
+               FROM lessons WHERE plan_id = ? ORDER BY ordinal""",
+            (plan["id"],),
+        ).fetchall()]
+    done = sum(1 for lesson in lessons if lesson["status"] == "done")
+    payload = dict(plan)
+    payload["lessons"] = lessons
+    payload["total_lessons"] = len(lessons)
+    payload["done_lessons"] = done
+    payload["percent"] = round(100 * done / len(lessons)) if lessons else 0
+    payload["minutes_left"] = sum(
+        int(lesson["estimated_minutes"]) for lesson in lessons if lesson["status"] != "done"
+    )
+    return payload
+
+
+def list_learning_plans(user_id: str) -> list[dict[str, Any]]:
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT learning_plans.id, learning_plans.title, learning_plans.status,
+                      learning_plans.book_id, learning_plans.target_date, learning_plans.daily_minutes,
+                      books.title AS book_title,
+                      COUNT(lessons.id) AS total_lessons,
+                      SUM(CASE WHEN lessons.status = 'done' THEN 1 ELSE 0 END) AS done_lessons
+               FROM learning_plans
+               JOIN books ON books.id = learning_plans.book_id
+               LEFT JOIN lessons ON lessons.plan_id = learning_plans.id
+               WHERE learning_plans.user_id = ? AND learning_plans.status != 'archived'
+               GROUP BY learning_plans.id
+               ORDER BY learning_plans.created_at DESC""",
+            (user_id,),
+        ).fetchall()
+    plans = []
+    for row in rows:
+        plan = dict(row)
+        total = int(plan["total_lessons"] or 0)
+        done = int(plan["done_lessons"] or 0)
+        plan["percent"] = round(100 * done / total) if total else 0
+        plans.append(plan)
+    return plans
+
+
+def delete_learning_plan(user_id: str, plan_id: str) -> dict[str, Any]:
+    with db() as conn:
+        deleted = conn.execute(
+            "DELETE FROM learning_plans WHERE id = ? AND user_id = ?", (str(plan_id).strip(), user_id)
+        ).rowcount
+    if not deleted:
+        raise ClientError("План не найден.")
+    return {"id": plan_id, "deleted": True}
+
+
+# --------------------------------------------------------------------------
+# Lesson content, quizzes and flashcards
+# --------------------------------------------------------------------------
+
+LESSON_SOURCE_CHAR_LIMIT = 24000
+QUIZ_QUESTION_COUNT = 5
+FLASHCARD_COUNT = 6
+SUMMARY_DISCLAIMER = (
+    "Это вспомогательный учебный материал по выбранным страницам, а не замена книги. "
+    "Для полного понимания читайте оригинал."
+)
+
+
+def owned_lesson(user_id: str, lesson_id: str) -> dict[str, Any]:
+    with db() as conn:
+        row = conn.execute(
+            """SELECT lessons.*, learning_plans.book_id, learning_plans.user_id AS owner,
+                      learning_plans.goal AS plan_goal, books.title AS book_title
+               FROM lessons
+               JOIN learning_plans ON learning_plans.id = lessons.plan_id
+               JOIN books ON books.id = learning_plans.book_id
+               WHERE lessons.id = ? AND learning_plans.user_id = ?""",
+            (str(lesson_id).strip(), user_id),
+        ).fetchone()
+    if not row:
+        raise ClientError("Занятие не найдено.")
+    return dict(row)
+
+
+def lesson_source_text(book_id: str, page_from: int, page_to: int) -> tuple[str, int]:
+    """The actual words of the lesson's pages, with page markers kept.
+
+    The markers are what let the model cite a page and what lets the reader
+    check the citation. Truncation is announced in the returned length rather
+    than hidden, so callers can tell the model it is seeing only part.
+    """
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT page_no, content FROM book_pages
+               WHERE book_id = ? AND page_no BETWEEN ? AND ? ORDER BY page_no""",
+            (book_id, page_from, page_to),
+        ).fetchall()
+    parts = [f"[стр. {row['page_no']}]\n{row['content']}" for row in rows]
+    text = "\n\n".join(parts)
+    return text[:LESSON_SOURCE_CHAR_LIMIT], len(text)
+
+
+def llm_json(instructions: str, prompt: str, max_tokens: int = 2600) -> dict[str, Any]:
+    """Ask the model for JSON and return it, or fail with a message we own.
+
+    Models occasionally wrap JSON in prose or a code fence. Rather than let a
+    stray backtick turn into a 500, the first balanced object in the reply is
+    extracted; only if that also fails does the caller hear about it.
+    """
+    payload = {
+        "model": ANSWER_MODEL,
+        "instructions": instructions,
+        "input": prompt,
+        "max_output_tokens": max_tokens,
+    }
+    raw = response_text(openai_request("responses", payload)).strip()
+    if not raw:
+        raise ClientError("Модель вернула пустой ответ. Попробуйте ещё раз.")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            return json.loads(raw[start : end + 1])
+        except json.JSONDecodeError:
+            pass
+    print(f"Lesson generation returned unusable output: {raw[:400]}", file=sys.stderr)
+    raise ClientError("Не удалось разобрать ответ модели. Попробуйте сформировать занятие ещё раз.")
+
+
+LESSON_INSTRUCTIONS = """Ты — NBrain, помощник по обучению. Тебе дают реальный текст нескольких страниц книги.
+Отвечай по-русски и строго в формате JSON без пояснений вокруг него.
+
+Работай ТОЛЬКО по переданному тексту. Ничего не добавляй из общих знаний о книге или авторе.
+Если чего-то в тексте нет — не пиши об этом. Лучше меньше пунктов, чем выдуманные.
+В каждом пункте, где это уместно, указывай номер страницы из маркеров [стр. N].
+
+Верни объект с полями:
+{
+  "title": "короткое название занятия по содержанию страниц",
+  "goal": "одно предложение: что человек будет понимать после занятия",
+  "summary": "3-5 абзацев пересказа того, что есть на этих страницах",
+  "key_ideas": [{"idea": "формулировка", "why": "почему важно", "page": 12}],
+  "terms": [{"term": "термин", "meaning": "объяснение простыми словами", "page": 12}],
+  "quotes": [{"text": "дословная цитата из текста", "page": 12}],
+  "practice": "одно практическое задание на применение",
+  "questions": [{"prompt": "вопрос", "options": ["A", "B", "C", "D"], "answer": 0, "explanation": "почему верен этот вариант", "page": 12}],
+  "flashcards": [{"front": "вопрос для вспоминания", "back": "краткий ответ", "page": 12}]
+}
+
+Цитаты обязаны быть дословными фрагментами переданного текста. Вопросов — ровно 5, вариантов в каждом — 4,
+"answer" — индекс правильного варианта от 0 до 3. Карточек — 6."""
+
+
+def coerce_page(value: Any, page_from: int, page_to: int) -> int | None:
+    """Keep a model-supplied page inside the lesson, or drop it.
+
+    A citation pointing outside the pages the model was shown is a citation it
+    could not have checked, and a wrong page number is worse than none: the
+    person follows it, finds nothing, and stops trusting the rest.
+    """
+    try:
+        page = int(value)
+    except (TypeError, ValueError):
+        return None
+    return page if page_from <= page <= page_to else None
+
+
+def clean_lesson_payload(raw: dict[str, Any], lesson: dict[str, Any]) -> dict[str, Any]:
+    page_from, page_to = int(lesson["page_from"]), int(lesson["page_to"])
+
+    def text_of(value: Any, limit: int) -> str:
+        return re.sub(r"\s+", " ", str(value or "")).strip()[:limit]
+
+    ideas = []
+    for item in (raw.get("key_ideas") or [])[:8]:
+        if not isinstance(item, dict):
+            continue
+        idea = text_of(item.get("idea"), 400)
+        if idea:
+            ideas.append({"idea": idea, "why": text_of(item.get("why"), 400),
+                          "page": coerce_page(item.get("page"), page_from, page_to)})
+    terms = []
+    for item in (raw.get("terms") or [])[:12]:
+        if not isinstance(item, dict):
+            continue
+        term = text_of(item.get("term"), 120)
+        if term:
+            terms.append({"term": term, "meaning": text_of(item.get("meaning"), 400),
+                          "page": coerce_page(item.get("page"), page_from, page_to)})
+    quotes = []
+    for item in (raw.get("quotes") or [])[:6]:
+        if not isinstance(item, dict):
+            continue
+        quote = text_of(item.get("text"), 600)
+        if quote:
+            quotes.append({"text": quote, "page": coerce_page(item.get("page"), page_from, page_to)})
+
+    questions = []
+    for item in (raw.get("questions") or [])[:QUIZ_QUESTION_COUNT]:
+        if not isinstance(item, dict):
+            continue
+        prompt = text_of(item.get("prompt"), 500)
+        options = [text_of(option, 300) for option in (item.get("options") or []) if text_of(option, 300)]
+        try:
+            answer = int(item.get("answer"))
+        except (TypeError, ValueError):
+            continue
+        # A question whose right answer is out of range is unusable and would
+        # mark a correct reply as wrong, so it is dropped rather than repaired.
+        if not prompt or len(options) < 2 or not 0 <= answer < len(options):
+            continue
+        questions.append({"prompt": prompt, "options": options, "answer": answer,
+                          "explanation": text_of(item.get("explanation"), 600),
+                          "page": coerce_page(item.get("page"), page_from, page_to)})
+
+    cards = []
+    for item in (raw.get("flashcards") or [])[:FLASHCARD_COUNT]:
+        if not isinstance(item, dict):
+            continue
+        front = text_of(item.get("front"), 300)
+        back = text_of(item.get("back"), 600)
+        if front and back:
+            cards.append({"front": front, "back": back,
+                          "page": coerce_page(item.get("page"), page_from, page_to)})
+
+    return {
+        "title": text_of(raw.get("title"), 200) or str(lesson["title"]),
+        "goal": text_of(raw.get("goal"), 400),
+        "summary": str(raw.get("summary") or "").strip()[:8000],
+        "key_ideas": ideas,
+        "terms": terms,
+        "quotes": quotes,
+        "practice": text_of(raw.get("practice"), 800),
+        "questions": questions,
+        "flashcards": cards,
+    }
+
+
+def generate_lesson(user_id: str, lesson_id: str, force: bool = False) -> dict[str, Any]:
+    """Build the study material for one lesson from the text of its own pages."""
+    lesson = owned_lesson(user_id, lesson_id)
+    if lesson["generated_at"] and not force:
+        return get_lesson(user_id, lesson_id)
+    source, full_length = lesson_source_text(lesson["book_id"], lesson["page_from"], lesson["page_to"])
+    if not source.strip():
+        raise ClientError("На этих страницах нет текста, по которому можно составить занятие.")
+    profile = get_learning_profile(user_id)
+    director = get_profile(user_id)
+    truncated = " Тебе передан только фрагмент этих страниц." if full_length > len(source) else ""
+    prompt = (
+        f"Книга: «{lesson['book_title']}».\n"
+        f"Страницы занятия: {lesson['page_from']}–{lesson['page_to']}.{truncated}\n"
+        f"Уровень читателя: {profile['level']}. Предпочитаемый формат: {profile['format']}.\n"
+        f"Цель обучения: {lesson.get('plan_goal') or director.get('goals') or 'не указана'}.\n\n"
+        f"Текст страниц:\n{source}"
+    )
+    data = clean_lesson_payload(llm_json(LESSON_INSTRUCTIONS, prompt), lesson)
+    stamp = now_iso()
+    with db() as conn:
+        conn.execute(
+            """UPDATE lessons SET title = ?, goal = ?, summary = ?, key_ideas_json = ?, terms_json = ?,
+                                  quotes_json = ?, practice = ?, generated_at = ?,
+                                  status = CASE WHEN status = 'planned' THEN 'in_progress' ELSE status END
+               WHERE id = ?""",
+            (data["title"], data["goal"], data["summary"],
+             json.dumps(data["key_ideas"], ensure_ascii=False),
+             json.dumps(data["terms"], ensure_ascii=False),
+             json.dumps(data["quotes"], ensure_ascii=False),
+             data["practice"], stamp, lesson["id"]),
+        )
+        conn.execute("DELETE FROM quiz_questions WHERE lesson_id = ?", (lesson["id"],))
+        conn.executemany(
+            """INSERT INTO quiz_questions (id, lesson_id, ordinal, prompt, options_json, answer, explanation, source_pages)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            [(str(uuid.uuid4()), lesson["id"], index + 1, question["prompt"],
+              json.dumps(question["options"], ensure_ascii=False), question["answer"],
+              question["explanation"], str(question["page"] or ""))
+             for index, question in enumerate(data["questions"])],
+        )
+        # Cards already in review keep their schedule: regenerating a lesson
+        # must not reset what the person has been practising for weeks.
+        existing = {row["front"] for row in conn.execute(
+            "SELECT front FROM flashcards WHERE user_id = ? AND lesson_id = ?", (user_id, lesson["id"])
+        ).fetchall()}
+        today = datetime.now(timezone.utc).date().isoformat()
+        for card in data["flashcards"]:
+            if card["front"] in existing:
+                continue
+            conn.execute(
+                """INSERT INTO flashcards (id, user_id, book_id, lesson_id, front, back, source_pages,
+                                           due_on, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (str(uuid.uuid4()), user_id, lesson["book_id"], lesson["id"], card["front"],
+                 card["back"], str(card["page"] or ""), today, stamp, stamp),
+            )
+    return get_lesson(user_id, lesson_id)
+
+
+def get_lesson(user_id: str, lesson_id: str, with_answers: bool = False) -> dict[str, Any]:
+    lesson = owned_lesson(user_id, lesson_id)
+    with db() as conn:
+        questions = [dict(row) for row in conn.execute(
+            "SELECT * FROM quiz_questions WHERE lesson_id = ? ORDER BY ordinal", (lesson["id"],)
+        ).fetchall()]
+        cards = conn.execute(
+            "SELECT COUNT(*) AS total FROM flashcards WHERE user_id = ? AND lesson_id = ?",
+            (user_id, lesson["id"]),
+        ).fetchone()["total"]
+        neighbours = conn.execute(
+            """SELECT
+                   (SELECT id FROM lessons WHERE plan_id = ? AND ordinal < ? ORDER BY ordinal DESC LIMIT 1) AS prev,
+                   (SELECT id FROM lessons WHERE plan_id = ? AND ordinal > ? ORDER BY ordinal LIMIT 1) AS next""",
+            (lesson["plan_id"], lesson["ordinal"], lesson["plan_id"], lesson["ordinal"]),
+        ).fetchone()
+    payload = {
+        "id": lesson["id"],
+        "plan_id": lesson["plan_id"],
+        "book_id": lesson["book_id"],
+        "book_title": lesson["book_title"],
+        "ordinal": lesson["ordinal"],
+        "title": lesson["title"],
+        "goal": lesson["goal"],
+        "page_from": lesson["page_from"],
+        "page_to": lesson["page_to"],
+        "estimated_minutes": lesson["estimated_minutes"],
+        "scheduled_for": lesson["scheduled_for"],
+        "status": lesson["status"],
+        "score": lesson["score"],
+        "generated": bool(lesson["generated_at"]),
+        "summary": lesson["summary"],
+        "disclaimer": SUMMARY_DISCLAIMER,
+        "key_ideas": json.loads(lesson["key_ideas_json"] or "[]"),
+        "terms": json.loads(lesson["terms_json"] or "[]"),
+        "quotes": json.loads(lesson["quotes_json"] or "[]"),
+        "practice": lesson["practice"],
+        "flashcard_count": int(cards),
+        "prev_lesson": neighbours["prev"],
+        "next_lesson": neighbours["next"],
+        "questions": [
+            {
+                "id": question["id"],
+                "ordinal": question["ordinal"],
+                "prompt": question["prompt"],
+                "options": json.loads(question["options_json"]),
+                "source_pages": question["source_pages"],
+                # The right answer is withheld until the quiz is submitted:
+                # it travels to the browser only in the result.
+                **({"answer": question["answer"], "explanation": question["explanation"]} if with_answers else {}),
+            }
+            for question in questions
+        ],
+    }
+    return payload
+
+
+def submit_quiz(user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Mark the answers, record the score and close the lesson."""
+    lesson = owned_lesson(user_id, str(payload.get("lesson_id", "")))
+    answers = payload.get("answers")
+    if not isinstance(answers, dict):
+        raise ClientError("Ответы должны быть переданы объектом.")
+    with db() as conn:
+        questions = [dict(row) for row in conn.execute(
+            "SELECT * FROM quiz_questions WHERE lesson_id = ? ORDER BY ordinal", (lesson["id"],)
+        ).fetchall()]
+    if not questions:
+        raise ClientError("У этого занятия ещё нет вопросов. Сформируйте материал занятия.")
+    results = []
+    correct = 0
+    for question in questions:
+        try:
+            given = int(answers.get(question["id"], -1))
+        except (TypeError, ValueError):
+            given = -1
+        is_right = given == int(question["answer"])
+        correct += 1 if is_right else 0
+        results.append({
+            "id": question["id"],
+            "prompt": question["prompt"],
+            "options": json.loads(question["options_json"]),
+            "given": given,
+            "answer": int(question["answer"]),
+            "correct": is_right,
+            "explanation": question["explanation"],
+            "source_pages": question["source_pages"],
+        })
+    score = round(100 * correct / len(questions))
+    stamp = now_iso()
+    with db() as conn:
+        conn.execute(
+            """UPDATE lessons SET status = 'done', score = ?, completed_at = ? WHERE id = ?""",
+            (score, stamp, lesson["id"]),
+        )
+        # A shaky result brings the lesson's cards back to today, so the weak
+        # material is the material that gets repeated.
+        if score < 70:
+            conn.execute(
+                """UPDATE flashcards SET due_on = ?, interval_days = 0, repetitions = 0, updated_at = ?
+                   WHERE user_id = ? AND lesson_id = ?""",
+                (datetime.now(timezone.utc).date().isoformat(), stamp, user_id, lesson["id"]),
+            )
+    record_study_session(user_id, "quiz", minutes=max(1, int(lesson["estimated_minutes"]) // 3),
+                         score=score, book_id=lesson["book_id"], lesson_id=lesson["id"])
+    close_plan_if_finished(user_id, lesson["plan_id"])
+    return {
+        "score": score,
+        "correct": correct,
+        "total": len(questions),
+        "passed": score >= 70,
+        "results": results,
+        "advice": quiz_advice(score),
+    }
+
+
+def quiz_advice(score: int) -> str:
+    if score >= 90:
+        return "Материал усвоен. Следующее занятие можно взять сразу."
+    if score >= 70:
+        return "Хороший результат. Карточки этого занятия закрепят детали."
+    return ("Стоит вернуться к страницам занятия и перечитать разделы из объяснений ниже. "
+            "Карточки этого занятия уже возвращены в повторение на сегодня.")
+
+
+def close_plan_if_finished(user_id: str, plan_id: str) -> None:
+    with db() as conn:
+        left = conn.execute(
+            "SELECT COUNT(*) AS total FROM lessons WHERE plan_id = ? AND status != 'done'", (plan_id,)
+        ).fetchone()["total"]
+        if not left:
+            conn.execute(
+                "UPDATE learning_plans SET status = 'done', updated_at = ? WHERE id = ? AND user_id = ?",
+                (now_iso(), plan_id, user_id),
+            )
+
+
+# --------------------------------------------------------------------------
+# Spaced repetition
+# --------------------------------------------------------------------------
+
+CARD_GRADES = {"again": 0, "hard": 3, "good": 4, "easy": 5}
+
+
+def schedule_card(card: dict[str, Any], grade: int) -> tuple[int, int, int, int]:
+    """SM-2 scheduling: returns (interval_days, ease, repetitions, lapses).
+
+    Kept deliberately close to the original algorithm — it is well understood
+    and predictable, and a person can reason about why a card came back today.
+    """
+    ease = int(card["ease"])
+    repetitions = int(card["repetitions"])
+    interval = int(card["interval_days"])
+    lapses = int(card["lapses"])
+    if grade < 3:
+        # Forgotten: back to the start, and the card gets a little easier to
+        # keep, so a hard card does not become impossible to ever clear.
+        return 0, max(130, ease - 20), 0, lapses + 1
+    repetitions += 1
+    if repetitions == 1:
+        interval = 1
+    elif repetitions == 2:
+        interval = 6
+    else:
+        interval = max(1, round(interval * ease / 100))
+    ease = max(130, min(350, ease + (10 if grade == 5 else 0) - (15 if grade == 3 else 0)))
+    return min(interval, 365), ease, repetitions, lapses
+
+
+def due_flashcards(user_id: str, limit: int = 20) -> dict[str, Any]:
+    today = datetime.now(timezone.utc).date().isoformat()
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT flashcards.id, flashcards.front, flashcards.back, flashcards.source_pages,
+                      flashcards.repetitions, books.title AS book_title, flashcards.book_id
+               FROM flashcards LEFT JOIN books ON books.id = flashcards.book_id
+               WHERE flashcards.user_id = ? AND flashcards.due_on <= ?
+               ORDER BY flashcards.due_on, flashcards.created_at
+               LIMIT ?""",
+            (user_id, today, max(1, min(limit, 100))),
+        ).fetchall()
+        totals = conn.execute(
+            """SELECT COUNT(*) AS total,
+                      SUM(CASE WHEN due_on <= ? THEN 1 ELSE 0 END) AS due
+               FROM flashcards WHERE user_id = ?""",
+            (today, user_id),
+        ).fetchone()
+    return {
+        "cards": [dict(row) for row in rows],
+        "due_total": int(totals["due"] or 0),
+        "total": int(totals["total"] or 0),
+    }
+
+
+def review_flashcard(user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    grade_name = str(payload.get("grade", "")).strip().lower()
+    if grade_name not in CARD_GRADES:
+        raise ClientError("Оценка должна быть: again, hard, good или easy.")
+    card_id = str(payload.get("id", "")).strip()
+    with db() as conn:
+        card = conn.execute(
+            "SELECT * FROM flashcards WHERE id = ? AND user_id = ?", (card_id, user_id)
+        ).fetchone()
+        if not card:
+            raise ClientError("Карточка не найдена.")
+        interval, ease, repetitions, lapses = schedule_card(dict(card), CARD_GRADES[grade_name])
+        due = datetime.now(timezone.utc).date() + timedelta(days=interval)
+        conn.execute(
+            """UPDATE flashcards SET interval_days = ?, ease = ?, repetitions = ?, lapses = ?,
+                                     due_on = ?, updated_at = ? WHERE id = ?""",
+            (interval, ease, repetitions, lapses, due.isoformat(), now_iso(), card_id),
+        )
+    return {"id": card_id, "due_on": due.isoformat(), "interval_days": interval,
+            "next_in": "сегодня" if interval == 0 else f"через {interval} дн."}
+
+
+def finish_flashcard_session(user_id: str, reviewed: int) -> dict[str, Any]:
+    reviewed = max(0, min(int(reviewed or 0), 500))
+    if reviewed:
+        record_study_session(user_id, "flashcards", minutes=max(1, round(reviewed * 0.4)))
+    return due_flashcards(user_id)
+
+
+# --------------------------------------------------------------------------
+# Progress and statistics
+# --------------------------------------------------------------------------
+
+def study_streak(days: list[str]) -> int:
+    """Consecutive days of study ending today or yesterday.
+
+    Yesterday counts as still alive: a streak that dies at midnight punishes
+    people for time zones and for finishing late, which is not what a streak
+    is for.
+    """
+    if not days:
+        return 0
+    seen = {datetime.strptime(day, "%Y-%m-%d").date() for day in days}
+    today = datetime.now(timezone.utc).date()
+    cursor = today if today in seen else today - timedelta(days=1)
+    if cursor not in seen:
+        return 0
+    streak = 0
+    while cursor in seen:
+        streak += 1
+        cursor -= timedelta(days=1)
+    return streak
+
+
+def fill_day_series(values: dict[str, int], last_day: Any, days: int) -> list[dict[str, Any]]:
+    series = []
+    for offset in range(days - 1, -1, -1):
+        day = (last_day - timedelta(days=offset)).isoformat()
+        series.append({"day": day, "minutes": int(values.get(day, 0))})
+    return series
+
+
+def learning_dashboard(user_id: str) -> dict[str, Any]:
+    """Everything the progress screen shows, in one request."""
+    today = datetime.now(timezone.utc).date()
+    since = (today - timedelta(days=29)).isoformat()
+    with db() as conn:
+        days = [str(row["day"]) for row in conn.execute(
+            "SELECT DISTINCT day FROM study_sessions WHERE user_id = ? ORDER BY day DESC LIMIT 400", (user_id,)
+        ).fetchall()]
+        totals = conn.execute(
+            """SELECT COALESCE(SUM(minutes), 0) AS minutes, COUNT(*) AS sessions
+               FROM study_sessions WHERE user_id = ?""", (user_id,)
+        ).fetchone()
+        month = conn.execute(
+            """SELECT day, SUM(minutes) AS minutes FROM study_sessions
+               WHERE user_id = ? AND day >= ? GROUP BY day ORDER BY day""",
+            (user_id, since),
+        ).fetchall()
+        lessons_done = conn.execute(
+            """SELECT COUNT(*) AS total, AVG(score) AS average FROM lessons
+               JOIN learning_plans ON learning_plans.id = lessons.plan_id
+               WHERE learning_plans.user_id = ? AND lessons.status = 'done'""",
+            (user_id,),
+        ).fetchone()
+        upcoming = [dict(row) for row in conn.execute(
+            """SELECT lessons.id, lessons.title, lessons.scheduled_for, lessons.estimated_minutes,
+                      lessons.status, lessons.ordinal, books.title AS book_title, lessons.plan_id
+               FROM lessons
+               JOIN learning_plans ON learning_plans.id = lessons.plan_id
+               JOIN books ON books.id = learning_plans.book_id
+               WHERE learning_plans.user_id = ? AND learning_plans.status = 'active' AND lessons.status != 'done'
+               ORDER BY lessons.scheduled_for, lessons.ordinal LIMIT 7""",
+            (user_id,),
+        ).fetchall()]
+        reading = [dict(row) for row in conn.execute(
+            """SELECT reading_progress.book_id, reading_progress.page_no, reading_progress.furthest_page,
+                      books.title AS book_title
+               FROM reading_progress JOIN books ON books.id = reading_progress.book_id
+               WHERE reading_progress.user_id = ? ORDER BY reading_progress.updated_at DESC LIMIT 5""",
+            (user_id,),
+        ).fetchall()]
+        notes_count = conn.execute(
+            "SELECT COUNT(*) AS total FROM notes WHERE user_id = ?", (user_id,)
+        ).fetchone()["total"]
+    for item in reading:
+        total_pages = ensure_pages_count(item["book_id"])
+        item["total_pages"] = total_pages
+        item["percent"] = reading_percent(item["book_id"], int(item["furthest_page"]), total_pages)
+    cards = due_flashcards(user_id, limit=1)
+    overdue = sum(1 for lesson in upcoming
+                  if lesson["scheduled_for"] and lesson["scheduled_for"] < today.isoformat())
+    return {
+        "streak": study_streak(days),
+        "minutes_total": int(totals["minutes"] or 0),
+        "sessions_total": int(totals["sessions"] or 0),
+        # Every one of the thirty days is returned, including the empty ones.
+        # A chart drawn only from days with activity has no shape: a single
+        # busy day would fill the whole width and look like a solid block.
+        "minutes_by_day": fill_day_series({str(row["day"]): int(row["minutes"] or 0) for row in month}, today, 30),
+        "lessons_done": int(lessons_done["total"] or 0),
+        "average_score": round(float(lessons_done["average"])) if lessons_done["average"] is not None else None,
+        "cards_due": cards["due_total"],
+        "cards_total": cards["total"],
+        "notes_total": int(notes_count or 0),
+        "upcoming": upcoming,
+        "overdue_lessons": overdue,
+        "reading": reading,
+        "achievements": achievements(user_id, days, int(lessons_done["total"] or 0), int(totals["minutes"] or 0)),
+    }
+
+
+def ensure_pages_count(book_id: str) -> int:
+    with db() as conn:
+        return int(conn.execute(
+            "SELECT COUNT(*) AS total FROM book_pages WHERE book_id = ?", (book_id,)
+        ).fetchone()["total"])
+
+
+ACHIEVEMENTS = [
+    ("first_lesson", "Первое занятие", "Завершено первое занятие", lambda s: s["lessons"] >= 1),
+    ("five_lessons", "Пять занятий", "Завершено пять занятий", lambda s: s["lessons"] >= 5),
+    ("twenty_lessons", "Двадцать занятий", "Завершено двадцать занятий", lambda s: s["lessons"] >= 20),
+    ("streak_3", "Три дня подряд", "Занятия три дня подряд", lambda s: s["streak"] >= 3),
+    ("streak_7", "Неделя подряд", "Занятия семь дней подряд", lambda s: s["streak"] >= 7),
+    ("streak_30", "Месяц подряд", "Занятия тридцать дней подряд", lambda s: s["streak"] >= 30),
+    ("hour", "Первый час", "Час занятий суммарно", lambda s: s["minutes"] >= 60),
+    ("ten_hours", "Десять часов", "Десять часов занятий суммарно", lambda s: s["minutes"] >= 600),
+]
+
+
+def achievements(user_id: str, days: list[str], lessons: int, minutes: int) -> list[dict[str, Any]]:
+    """Milestones, computed on the fly rather than stored.
+
+    Nothing here needs a row of its own: the facts live in study_sessions and
+    lessons already, and deriving the badges keeps them honest if data changes.
+    """
+    state = {"streak": study_streak(days), "lessons": lessons, "minutes": minutes}
+    return [
+        {"id": key, "title": title, "description": description, "earned": bool(rule(state))}
+        for key, title, description, rule in ACHIEVEMENTS
+    ]
 
 
 def memory_context(user_id: str) -> str:
@@ -2915,11 +4295,11 @@ def create_docx_export(user_id: str, question: str, answer: str, sources: list[d
         from docx.shared import Pt
     except ImportError as error:
         raise ClientError("Для экспорта Word установите зависимости: python -m pip install -r requirements.txt") from error
-    profile = get_profile(user_id)
+    prepared_for = profile_display_name(user_id)
     document = Document()
     title = document.add_heading("NBrain — Стратегический план", level=0)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    subtitle = document.add_paragraph(f"Подготовлено для: {profile['name']}\n{datetime.now().strftime('%d.%m.%Y')}")
+    subtitle = document.add_paragraph(f"Подготовлено для: {prepared_for}\n{datetime.now().strftime('%d.%m.%Y')}")
     subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
     subtitle.runs[0].font.size = Pt(10)
     if question:
@@ -2960,7 +4340,7 @@ def create_pdf_export(user_id: str, question: str, answer: str, sources: list[di
     except ImportError as error:
         raise ClientError("Для экспорта PDF установите зависимости: python -m pip install -r requirements.txt") from error
     font_name = pdf_font_name()
-    profile = get_profile(user_id)
+    prepared_for = profile_display_name(user_id)
     buffer = BytesIO()
     document = SimpleDocTemplate(buffer, pagesize=A4, leftMargin=20 * mm, rightMargin=20 * mm, topMargin=18 * mm, bottomMargin=18 * mm)
     styles = getSampleStyleSheet()
@@ -2970,7 +4350,7 @@ def create_pdf_export(user_id: str, question: str, answer: str, sources: list[di
     body_style = ParagraphStyle("NBrainBody", parent=styles["BodyText"], fontName=font_name, leading=16, spaceAfter=7)
     story = [
         Paragraph("NBrain — Стратегический план", title_style),
-        Paragraph(f"Подготовлено для: {html_escape(profile['name'])}<br/>{datetime.now().strftime('%d.%m.%Y')}", subtitle_style),
+        Paragraph(f"Подготовлено для: {html_escape(prepared_for)}<br/>{datetime.now().strftime('%d.%m.%Y')}", subtitle_style),
     ]
     if question:
         story.extend([Paragraph("Запрос", heading_style), Paragraph(html_escape(question), body_style)])
@@ -2998,17 +4378,21 @@ def answer_question(
 ) -> str:
     profile = get_profile(user_id)
     saved_context = memory_context(user_id)
-    director = profile["name"] or DEFAULT_DIRECTOR_NAME
+    director = profile_display_name(user_id, profile)
     context = "\n\n".join(
         f"[S{i}] Книга: {source['title']}; страницы {source['page_from']}–{source['page_to']}\n{source['content']}"
         for i, source in enumerate(sources, start=1)
     )
+    # Empty fields are stated as empty. Telling the model "CliftonStrengths: "
+    # with nothing after it invites it to invent them.
     profile_context = "\n".join(
         [
-            f"Имя: {profile['name']}",
-            f"CliftonStrengths: {', '.join(profile['strengths'])}",
+            f"Имя: {director}",
+            f"CliftonStrengths: {', '.join(profile['strengths']) or 'не указаны'}",
             f"Текущие цели: {profile['goals'] or 'не указаны'}",
             f"Текущий фокус: {profile['focus'] or 'не указан'}",
+            "Пустые поля профиля не домысливай: если сильные стороны, цели или фокус"
+            " не указаны, не приписывай их пользователю и дай совет общего вида.",
         ]
     )
     instructions = """Ты — NBrain, AI Director Advisor. Отвечай по-русски и только на основе переданных источников.
@@ -3328,6 +4712,36 @@ class AppHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/memories":
             self.json_response(HTTPStatus.OK, {"memories": list_memories(self.user_id)})
             return
+        if parsed.path == "/api/reader/state":
+            query = {key: values[-1] for key, values in parse_qs(parsed.query).items() if values}
+            self.json_response(HTTPStatus.OK, reading_state(self.user_id, str(query.get("book_id", ""))))
+            return
+        if parsed.path == "/api/reader/page":
+            query = {key: values[-1] for key, values in parse_qs(parsed.query).items() if values}
+            self.json_response(HTTPStatus.OK, read_page(
+                self.user_id, str(query.get("book_id", "")), catalog_int(query.get("page", 1), 1)))
+            return
+        if parsed.path == "/api/notes":
+            query = {key: values[-1] for key, values in parse_qs(parsed.query).items() if values}
+            self.json_response(HTTPStatus.OK, {"notes": list_notes(self.user_id, query.get("book_id"))})
+            return
+        if parsed.path == "/api/plans":
+            self.json_response(HTTPStatus.OK, {"plans": list_learning_plans(self.user_id)})
+            return
+        if parsed.path == "/api/plan":
+            query = {key: values[-1] for key, values in parse_qs(parsed.query).items() if values}
+            self.json_response(HTTPStatus.OK, {"plan": get_learning_plan(self.user_id, str(query.get("id", "")))})
+            return
+        if parsed.path == "/api/lesson":
+            query = {key: values[-1] for key, values in parse_qs(parsed.query).items() if values}
+            self.json_response(HTTPStatus.OK, {"lesson": get_lesson(self.user_id, str(query.get("id", "")))})
+            return
+        if parsed.path == "/api/flashcards":
+            self.json_response(HTTPStatus.OK, due_flashcards(self.user_id))
+            return
+        if parsed.path == "/api/progress":
+            self.json_response(HTTPStatus.OK, learning_dashboard(self.user_id))
+            return
         if parsed.path in {"/", "/verify", "/reset"}:
             # /verify and /reset are the addresses inside e-mail links. They
             # serve the same page; the script reads the token from the query
@@ -3505,6 +4919,44 @@ class AppHandler(SimpleHTTPRequestHandler):
             if self.path == "/api/memories":
                 self.json_response(HTTPStatus.CREATED, {"memory": save_memory(self.user_id, self.read_json())})
                 return
+            if self.path == "/api/reader/progress":
+                self.json_response(HTTPStatus.OK, save_reading_progress(self.user_id, self.read_json()))
+                return
+            if self.path == "/api/reader/bookmark":
+                self.json_response(HTTPStatus.OK, toggle_bookmark(self.user_id, self.read_json()))
+                return
+            if self.path == "/api/notes":
+                self.json_response(HTTPStatus.CREATED, {"note": save_note(self.user_id, self.read_json())})
+                return
+            if self.path == "/api/notes/delete":
+                body = self.read_json()
+                self.json_response(HTTPStatus.OK, delete_note(self.user_id, str(body.get("id", ""))))
+                return
+            if self.path == "/api/plans":
+                self.json_response(HTTPStatus.CREATED, {"plan": build_learning_plan(self.user_id, self.read_json())})
+                return
+            if self.path == "/api/plans/delete":
+                body = self.read_json()
+                self.json_response(HTTPStatus.OK, delete_learning_plan(self.user_id, str(body.get("id", ""))))
+                return
+            if self.path == "/api/lesson/generate":
+                # Generating a lesson is a language-model call over several
+                # pages of text, so it costs money and shares the answer quota.
+                self.limit("answer")
+                body = self.read_json()
+                self.json_response(HTTPStatus.OK, {"lesson": generate_lesson(
+                    self.user_id, str(body.get("id", "")), bool(body.get("force")))})
+                return
+            if self.path == "/api/lesson/quiz":
+                self.json_response(HTTPStatus.OK, submit_quiz(self.user_id, self.read_json()))
+                return
+            if self.path == "/api/flashcards/review":
+                self.json_response(HTTPStatus.OK, review_flashcard(self.user_id, self.read_json()))
+                return
+            if self.path == "/api/flashcards/finish":
+                body = self.read_json()
+                self.json_response(HTTPStatus.OK, finish_flashcard_session(self.user_id, body.get("reviewed", 0)))
+                return
             if self.path == "/api/search":
                 self.limit("search")
                 body = self.read_json()
@@ -3647,8 +5099,9 @@ def run_cli(argv: list[str]) -> None:
 
     `python server.py users` lists the accounts, `python server.py adduser
     <логин> <пароль> [--admin] [--name Имя]` creates one, `python server.py
-    passwd <логин> <пароль>` resets a forgotten password and `python server.py
-    backup [путь]` writes a consistent copy of the database.
+    rename <логин> <имя>` changes the name shown in the interface,
+    `python server.py passwd <логин> <пароль>` resets a forgotten password and
+    `python server.py backup [путь]` writes a consistent copy of the database.
     """
     init_storage()
     command = argv[0]
@@ -3673,6 +5126,23 @@ def run_cli(argv: list[str]) -> None:
         })
         print(f"Аккаунт «{user['username']}» создан.")
         return
+    if command == "rename":
+        if len(argv) < 3:
+            raise SystemExit("Использование: python server.py rename <логин> <новое имя>")
+        user = find_user(argv[1])
+        if not user:
+            raise SystemExit(f"Аккаунт «{argv[1]}» не найден.")
+        # Goes through save_profile so the profile and the header show the same
+        # name, exactly as if the owner had typed it on the profile screen.
+        profile = get_profile(user["id"])
+        profile = save_profile(user["id"], {
+            "name": " ".join(argv[2:]),
+            "strengths": profile["strengths"],
+            "goals": profile["goals"],
+            "focus": profile["focus"],
+        })
+        print(f"Аккаунт «{user['username']}» теперь отображается как «{profile['name']}».")
+        return
     if command == "passwd":
         if len(argv) < 3:
             raise SystemExit("Использование: python server.py passwd <логин> <новый пароль>")
@@ -3682,7 +5152,9 @@ def run_cli(argv: list[str]) -> None:
         set_user_password(user["id"], argv[2])
         print(f"Пароль аккаунта «{user['username']}» изменён; его прежние сессии закрыты.")
         return
-    raise SystemExit(f"Неизвестная команда «{command}». Доступны: users, adduser, passwd, backup.")
+    raise SystemExit(
+        f"Неизвестная команда «{command}». Доступны: users, adduser, rename, passwd, backup."
+    )
 
 
 def backup_database(destination: Path | None = None) -> Path:

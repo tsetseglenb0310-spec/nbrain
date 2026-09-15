@@ -40,22 +40,25 @@
         <a href="#development-section" data-section-link="development-section"><span>02</span>Развитие</a>
         <a href="#knowledge-section" data-section-link="knowledge-section"><span>03</span>Книги</a>
         <a href="#analysis-section" data-section-link="analysis-section"><span>04</span>Анализ</a>
-        <a href="#memory-section" data-section-link="memory-section"><span>05</span>Память и действия</a>
+        <a href="#learning-section" data-section-link="learning-section"><span>05</span>Обучение</a>
+        <a href="#reader-section" data-section-link="reader-section"><span>06</span>Чтение</a>
+        <a href="#progress-section" data-section-link="progress-section"><span>07</span>Прогресс</a>
+        <a href="#memory-section" data-section-link="memory-section"><span>08</span>Память и действия</a>
       </nav>
 
       <details id="profile-section" data-workspace-panel="profile-section" class="card profile-card workspace-section" aria-labelledby="profile-title">
         <summary>
-          <div><p class="section-label">ПРОФИЛЬ</p><h2 id="profile-title">Профиль Мухамеда Чапанова</h2></div>
+          <div><p class="section-label">ПРОФИЛЬ</p><h2 id="profile-title">Профиль</h2></div>
           <span class="summary-hint">Изменить</span>
         </summary>
         <div class="profile-content">
-          <p>NBrain использует профиль только для адаптации управленческих советов.</p>
+          <p>Профиль пустой, пока вы его не заполните. NBrain использует его только для того, чтобы точнее подбирать рекомендации; любое поле можно оставить пустым или очистить.</p>
         <form id="profile-form" class="profile-form">
           <div class="profile-grid">
-            <label for="director-name">Имя<input id="director-name" maxlength="120" placeholder="Мухамед Чапанов" /></label>
+            <label for="director-name">Имя<input id="director-name" maxlength="120" placeholder="Как к вам обращаться" /></label>
             <label for="director-focus">Текущий фокус<input id="director-focus" maxlength="1000" placeholder="Например: масштабирование компании" /></label>
           </div>
-          <label for="director-strengths">CliftonStrengths через запятую<textarea id="director-strengths" rows="2" placeholder="Strategic, Learner, Achiever..."></textarea></label>
+          <label for="director-strengths">Сильные стороны через запятую<textarea id="director-strengths" rows="2" placeholder="Если проходили CliftonStrengths — перечислите свои темы. Можно оставить пустым."></textarea></label>
           <label for="director-goals">Цели на ближайший период<textarea id="director-goals" rows="3" placeholder="Например: сформировать стратегию на 12 месяцев"></textarea></label>
           <div class="form-actions"><button id="profile-save" type="submit">Сохранить профиль</button></div>
         </form>
@@ -256,6 +259,58 @@
         <div id="action-list" class="action-list"><p class="empty-state">Действий пока нет.</p></div>
         <h3>Сохранённые идеи</h3>
         <div id="memory-list" class="memory-list"><p class="empty-state">Сохранённых идей пока нет.</p></div>
+      </section>
+
+      <section id="learning-section" data-workspace-panel="learning-section" class="card learning-card workspace-section" aria-labelledby="learning-title">
+        <div id="learning-plans-view">
+          <div class="section-heading">
+            <div>
+              <p class="section-label">ПЕРСОНАЛЬНАЯ ПРОГРАММА</p>
+              <h2 id="learning-title">План обучения по книге</h2>
+              <p>NBrain делит книгу на занятия по объёму текста и вашему времени в день, расставляет даты и готовит по каждому занятию конспект, вопросы и карточки — строго по страницам этого занятия.</p>
+            </div>
+          </div>
+
+          <form id="plan-form" class="profile-form">
+            <div class="profile-grid">
+              <label for="plan-book">Книга<select id="plan-book" required></select></label>
+              <label for="plan-minutes">Минут в день<input id="plan-minutes" type="number" min="5" max="480" step="5" value="20" required /></label>
+              <label for="plan-date">Целевая дата<input id="plan-date" type="date" /></label>
+              <label for="plan-goal">Зачем читаете<input id="plan-goal" maxlength="500" placeholder="Например: собрать стратегию на год" /></label>
+            </div>
+            <div class="form-actions"><button type="submit">Составить план</button></div>
+          </form>
+          <p id="plan-status" class="status" aria-live="polite"></p>
+
+          <h3>Ваши планы</h3>
+          <div id="plan-list" class="plan-list"></div>
+
+          <h3>Повторение</h3>
+          <div id="flashcard-panel" class="flashcard-panel"></div>
+        </div>
+
+        <div id="lesson-view" class="hidden">
+          <button type="button" id="lesson-back" class="link-button">← К списку планов</button>
+          <div id="lesson-body"></div>
+        </div>
+      </section>
+
+      <section id="reader-section" data-workspace-panel="reader-section" class="card reader-card workspace-section" aria-labelledby="reader-title">
+        <div class="section-heading">
+          <div>
+            <p class="section-label">ЧТЕНИЕ</p>
+            <h2 id="reader-title">Читалка</h2>
+            <p>Текст ровно тот, что NBrain извлёк из вашего файла. Позиция, закладки и заметки сохраняются на сервере — можно продолжить с другого устройства.</p>
+          </div>
+          <label for="reader-book" class="reader-picker">Книга<select id="reader-book"></select></label>
+        </div>
+        <div id="reader-body"></div>
+      </section>
+
+      <section id="progress-section" data-workspace-panel="progress-section" class="card progress-card workspace-section" aria-labelledby="progress-title">
+        <p class="section-label">ПРОГРЕСС</p>
+        <h2 id="progress-title">Статистика обучения</h2>
+        <div id="progress-body"><p class="empty-state">Загружаю…</p></div>
       </section>
     </main>
 

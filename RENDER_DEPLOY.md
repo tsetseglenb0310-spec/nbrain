@@ -1,8 +1,8 @@
 # Публикация NBrain на Render и домене nbrain-ts.org
 
 Этот способ делает NBrain доступным по защищённому адресу
-`https://app.nbrain-ts.org` с компьютера и телефона. Он рассчитан на
-персональный доступ Мухамеда Чапанова.
+`https://app.nbrain-ts.org` с компьютера и телефона. Каждый читатель заводит
+собственный аккаунт и заполняет профиль сам: чужих данных в новом аккаунте нет.
 
 ## Перед началом
 
@@ -41,7 +41,8 @@
 | `OPENAI_API_KEY` | ваш новый действующий ключ OpenAI |
 | `ANTHROPIC_API_KEY` | необязательно: ключ Anthropic API для режима Claude |
 | `NBRAIN_AUTH_REQUIRED` | `1` |
-| `NBRAIN_ADMIN_USERNAME` | логин первого аккаунта, например `muhamed` |
+| `NBRAIN_ADMIN_USERNAME` | логин первого аккаунта латиницей, например `admin` |
+| `NBRAIN_ADMIN_DISPLAY_NAME` | имя, которое видно в интерфейсе, например `Цэцэглэн` |
 | `NBRAIN_ADMIN_PASSWORD` | отдельный длинный пароль для входа в NBrain |
 | `NBRAIN_SESSION_SECRET` | длинная случайная строка, не менее 32 символов |
 | `NBRAIN_SECURE_COOKIES` | `1` |
