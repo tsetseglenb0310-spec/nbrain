@@ -1,190 +1,124 @@
-# NBrain MVP
+# NBrain — turn any book into a personal study course
 
-Первая рабочая версия NBrain реализует ровно пять функций:
+[![Live](https://img.shields.io/badge/live-app.nbrain--ts.org-2ea44f)](https://app.nbrain-ts.org)
+![Python](https://img.shields.io/badge/python-3.11%2B-blue)
+![Dependencies](https://img.shields.io/badge/runtime%20deps-3-lightgrey)
+![License](https://img.shields.io/badge/license-MIT-green)
 
-1. загрузка PDF, EPUB и TXT;
-2. извлечение текста и индексирование чанков;
-3. семантический поиск по книге или библиотеке;
-4. ответ LLM только на основе найденных фрагментов;
-5. отображение книги, страниц и фрагментов-источников.
+NBrain is a self-hosted web app that takes a PDF, EPUB or TXT book, indexes it
+for semantic search, answers questions **only from the text it found** (with
+page-level sources you can verify), and then builds a study plan around the
+book: lessons with summaries, quizzes, spaced-repetition flashcards and a
+progress dashboard.
 
-## Запуск
+I built it because I read a lot of technical and management books and kept
+losing what I had read. A chatbot that "knows" the book was not enough — I
+wanted something that shows me the page it is quoting and makes me come back.
 
-Требуется Python 3.11+, ключ OpenAI API и интернет.
+<!-- TODO: add screenshot -->
+<!-- ![NBrain — reader and lesson view](docs/screenshot.png) -->
 
-```powershell
-cd nbrain_mvp
+> 🇷🇺 Подробная техническая документация на русском: [docs/README.ru.md](docs/README.ru.md)
+
+## What it does
+
+- **Upload & index** — PDF/EPUB/TXT → text extraction → 450-word chunks with
+  overlap → OpenAI embeddings → normalized float32 vectors in SQLite.
+  Indexing runs in a background worker pool; the UI polls status, you can close the tab.
+- **Semantic search & grounded answers** — cosine search over the whole library
+  (one numpy matrix product, pure-Python fallback), then an OpenAI or Claude
+  answer built strictly from the six best fragments, each shown as a clickable source.
+- **Reader** — books are stored a second time as plain pages for reading;
+  position, bookmarks and notes are kept server-side so you can continue from your phone.
+- **Study plan** — the book is split into lessons by *text volume*, not page count,
+  and scheduled from your minutes-per-day and target date.
+- **Lessons** — summary, key ideas, terms, quotes, a practical task, five quiz
+  questions and six flashcards, all generated from the pages of that lesson only.
+  Any citation outside the lesson range is discarded: a wrong page number is worse than none.
+- **Spaced repetition** — SM-2 scheduling (1 day, 6 days, then by ease factor);
+  a quiz score under 70 % sends the lesson's cards back into rotation.
+- **Progress** — streaks, minutes, average score, a 30-day chart and achievements.
+  Achievements are *derived* from the activity log, never stored, so they cannot drift from the facts.
+- **Multi-user** — private libraries per account, e-mail verification and password
+  reset, admin console, per-account rate limits, one-click export and deletion of all your data.
+
+## Architecture
+
+```
+web/  (vanilla JS, no framework)  ──HTTP/JSON──▶  server.py  (single file, ~5 000 lines)
+                                                     ├─ http.server + threads   ← no web framework
+                                                     ├─ SQLite  (books, chunks, users, plans, cards)
+                                                     ├─ OpenAI API  (embeddings, answers)   via urllib
+                                                     └─ Anthropic API  (analysis, optional)  via urllib
+```
+
+Deliberate choices:
+
+- **Standard library first.** The server is `http.server` + `sqlite3` + `threading`;
+  the only runtime dependencies are `pypdf`, `numpy` (optional accelerator) and
+  a few exporters. No Flask, no ORM, no OpenAI SDK — every HTTP call to the
+  model providers is a plain `urllib` request, which made retries, timeouts and
+  cost control easy to reason about and the whole app trivial to deploy.
+- **SQLite on purpose.** The product must start with one command and no Docker.
+  Vectors are stored as normalized float32 BLOBs (6 KB instead of 31 KB as JSON),
+  so cosine similarity is a dot product and a library of tens of thousands of chunks
+  searches in milliseconds. The storage layer is isolated; PostgreSQL + pgvector is the planned next step.
+- **Security done properly for a personal cloud app.** PBKDF2-SHA256 passwords,
+  cookies signed with the owner's password fingerprint (changing a password logs out only that account),
+  login throttling that only trusts `X-Forwarded-For` behind a declared proxy,
+  refusal to start in no-auth mode on a non-loopback interface, per-account quotas on every paid operation.
+- **Structure from code, content from the book.** The lesson planner computes
+  *where* lessons begin and end; the model only writes *what* is on those pages.
+
+## Run it locally
+
+Python 3.11+, an OpenAI API key and internet access.
+
+```bash
+git clone https://github.com/tsetseglenb0310-spec/nbrain.git
+cd nbrain
 python -m pip install -r requirements.txt
-$env:OPENAI_API_KEY = "ваш_новый_ключ_OpenAI"
+cp .env.example .env          # set OPENAI_API_KEY, NBRAIN_ADMIN_PASSWORD, NBRAIN_SESSION_SECRET
 python server.py
 ```
 
-Откройте [http://127.0.0.1:8000](http://127.0.0.1:8000).
+Open http://127.0.0.1:8000. The first account is created from `.env`; other
+users register themselves (or set `NBRAIN_REGISTRATION_OPEN=0`).
 
-Для Windows можно использовать `set OPENAI_API_KEY=ваш_ключ` в `cmd.exe` вместо PowerShell.
+Docker: `docker compose up -d --build`. Deployment notes for Render are in
+[RENDER_DEPLOY.md](RENDER_DEPLOY.md); the full list of environment variables is in [.env.example](.env.example).
 
-## Что происходит при загрузке
-
-```text
-Файл → извлечение текста → чанки по 450 слов с overlap 70 слов
-→ OpenAI embeddings → нормализация → float32 BLOB в SQLite
-→ поиск по скалярному произведению → OpenAI- или Claude-ответ с источниками
-```
-
-Загрузка отвечает сразу, а индексация идёт в фоне: интерфейс показывает статус книги и обновляет его сам. Вкладку можно закрыть.
-
-Индексация выполняется пулом из двух рабочих потоков с общей очередью, поэтому десяток книг, брошенных в окно разом, обрабатывается по очереди, а не открывает десяток параллельных диалогов с OpenAI. Размер пула и очереди меняются переменными `NBRAIN_INDEX_WORKERS` (по умолчанию 2) и `NBRAIN_INDEX_QUEUE` (64); при переполнении очереди загрузка отвечает понятной ошибкой, а книга помечается как `failed` с предложением переиндексировать её позже.
-
-Эмбеддинги хранятся как нормализованные float32-блобы, поэтому косинусная близость — это обычное скалярное произведение, а вектор занимает 6 КБ вместо 31 КБ в прежнем JSON-формате. При первом запуске новой версии старая база конвертируется автоматически (один раз, с сообщением в логе).
-
-Скан библиотеки выполняется одним матричным произведением через `numpy`. Он включён в `requirements.txt` и ставится по умолчанию, но остаётся необязательным во время работы: если импорт не удался, сервер переключается на чистый Python — медленнее, но полностью рабочий путь. Проверить, какой путь активен, можно в `/api/health` (`vector_backend`) или в первой строке лога при старте.
-
-В MVP используется SQLite, потому что продукт должен запускаться без Docker. Интерфейс и RAG-конвейер изолированы от хранилища: в следующей версии таблица `chunks` переносится в PostgreSQL + pgvector, а поиск — на гибридный поиск и reranking.
-
-## Обучение
-
-Загруженная книга превращается в учебный маршрут. Логика разделена намеренно:
-структуру считает код, содержание берётся из текста книги.
-
-**Читалка.** При индексации книга сохраняется дважды: перекрывающимися
-фрагментами для поиска и обычными страницами для чтения. Перекрытие нужно
-поиску и мешает чтению, поэтому формы разные. TXT разбивается на страницы по
-400 слов по границам абзацев, PDF и EPUB сохраняют своё деление. Позиция,
-закладки и заметки хранятся на сервере — можно продолжить с другого устройства.
-Максимальная достигнутая страница только растёт: возврат назад не сбрасывает
-прогресс.
-
-**План.** Книга делится на занятия по объёму текста, а не по числу страниц:
-страница диалога и страница плотной прозы — разная работа. Размер занятия
-считается из ваших минут в день, календарь — из целевой даты. Если срок ближе,
-чем число занятий, они уплотняются.
-
-**Занятие.** Конспект, ключевые идеи, термины, цитаты, практическое задание,
-пять вопросов и шесть карточек строятся по тексту именно этих страниц. Ссылка на
-страницу за пределами занятия отбрасывается: неверный номер хуже, чем никакого.
-Результат сохраняется в базе — повторное открытие бесплатно. Каждый конспект
-помечен как вспомогательный материал, а не замена книги.
-
-**Повторение.** Карточки планируются по SM-2: 1 день, 6 дней, дальше по
-коэффициенту лёгкости. Забытая карточка возвращается на сегодня. Результат теста
-ниже 70% возвращает карточки занятия в повторение — повторяется то, что даётся
-хуже.
-
-**Прогресс.** Серия дней подряд, минуты, пройденные занятия, средний балл,
-график за 30 дней, ближайшие занятия и достижения. Достижения не хранятся —
-они выводятся из журнала занятий, поэтому не могут разойтись с фактами.
-
-## Ограничения MVP
-
-- PDF должен содержать текстовый слой; OCR для сканов пока не реализован.
-- Поиск сканирует всю библиотеку: время растёт линейно с числом фрагментов. До нескольких десятков тысяч фрагментов это доли секунды, дальше нужен векторный индекс (pgvector или sqlite-vec).
-- Поиск использует OpenAI embedding-модель `text-embedding-3-small`; для индексации и поиска нужен доступ к OpenAI API.
-- Для генерации ответа нужен `OPENAI_API_KEY` с доступным API-балансом.
-- В ответ передаются шесть наиболее релевантных фрагментов; интерфейс показывает их как проверяемые источники.
-- Смена `NBRAIN_EMBEDDING_MODEL` требует переиндексации книг — кнопка есть в разделе «Книги».
+Tests: `python -m unittest discover tests` (HTTP API, RAG pipeline, path-traversal protection).
 
 ## API
 
-| Метод | Путь | Назначение |
-|---|---|---|
-| `GET` | `/api/health` | Проверить работу сервиса. Подробности о конфигурации — только с сессией. |
-| `GET` | `/api/books` | Получить список книг со статусом индексации. |
-| `POST` | `/api/books` | Загрузить файл. Отвечает `202` и индексирует в фоне. |
-| `POST` | `/api/books/reindex` | Переиндексировать книгу текущей моделью эмбеддингов. |
-| `POST` | `/api/books/delete` | Удалить книгу, её фрагменты и исходный файл. |
-| `POST` | `/api/search` | Найти фрагменты по смыслу. |
-| `POST` | `/api/answer` | Получить ответ и источники. |
-| `POST` | `/api/auth/login` | Войти по логину или почте и паролю. Без логина открывается основной аккаунт. |
-| `POST` | `/api/auth/register` | Самостоятельная регистрация по почте и паролю. |
-| `POST` | `/api/auth/verify` | Подтвердить адрес по ссылке из письма. |
-| `POST` | `/api/auth/forgot` | Запросить ссылку для смены пароля. |
-| `POST` | `/api/auth/reset` | Задать новый пароль по ссылке из письма. |
-| `GET` | `/api/interests` | Справочник тем и навыков для анкеты. |
-| `GET`, `POST` | `/api/onboarding` | Прочитать и сохранить анкету обучения. |
-| `GET` | `/api/account/export` | Скачать все свои данные одним JSON. |
-| `POST` | `/api/account/delete` | Удалить свой аккаунт, подтвердив паролем. |
-| `GET` | `/api/admin/mail-log` | Последние письма, когда SMTP не настроен. Только администратор. |
-| `GET` | `/api/reader/state` | Позиция чтения, процент, закладки. |
-| `GET` | `/api/reader/page` | Текст одной страницы книги с заметками к ней. |
-| `POST` | `/api/reader/progress` | Сохранить страницу и время чтения. |
-| `POST` | `/api/reader/bookmark` | Поставить или снять закладку. |
-| `GET`, `POST` | `/api/notes` | Заметки к страницам; `/api/notes/delete` — удалить. |
-| `GET`, `POST` | `/api/plans` | Планы обучения; `POST` строит новый по книге. |
-| `GET` | `/api/plan` | План с занятиями и прогрессом. |
-| `GET` | `/api/lesson` | Занятие: конспект, идеи, термины, цитаты, вопросы без ответов. |
-| `POST` | `/api/lesson/generate` | Собрать материал занятия по страницам книги. |
-| `POST` | `/api/lesson/quiz` | Проверить ответы, получить разбор и оценку. |
-| `GET` | `/api/flashcards` | Карточки к повторению на сегодня. |
-| `POST` | `/api/flashcards/review` | Оценить карточку: again, hard, good, easy. |
-| `GET` | `/api/progress` | Статистика, серия дней, ближайшие занятия, достижения. |
-| `GET` | `/api/users` | Список аккаунтов. Только для администратора. |
-| `POST` | `/api/users` | Создать аккаунт. Только для администратора. |
-| `POST` | `/api/users/delete` | Удалить аккаунт со всеми его данными. Только для администратора. |
-| `POST` | `/api/users/password` | Сменить свой пароль (нужен текущий) или чужой — администратором. |
+Everything except `/api/health` and `/api/auth/*` is scoped to the signed-in
+account — another user's `book_id` simply does not exist for you.
 
-Все запросы, кроме `/api/health` и `/api/auth/*`, работают в границах аккаунта, который вошёл: чужой `book_id` не найдётся, даже если его подставить вручную.
+| Area | Endpoints |
+|---|---|
+| Books | `GET/POST /api/books`, `/api/books/reindex`, `/api/books/delete` |
+| Search & answers | `POST /api/search`, `POST /api/answer` |
+| Reader | `/api/reader/state`, `/api/reader/page`, `/api/reader/progress`, `/api/reader/bookmark`, `/api/notes` |
+| Learning | `/api/plans`, `/api/plan`, `/api/lesson`, `/api/lesson/generate`, `/api/lesson/quiz`, `/api/flashcards`, `/api/flashcards/review`, `/api/progress` |
+| Accounts | `/api/auth/{login,register,verify,forgot,reset}`, `/api/onboarding`, `/api/account/{export,delete}` |
+| Admin | `/api/users`, `/api/users/delete`, `/api/users/password`, `/api/admin/mail-log` |
 
-## Аккаунты
+Full table with descriptions: [docs/README.ru.md](docs/README.ru.md#api).
 
-У каждого аккаунта своя библиотека книг, свой профиль, свой каталог развития, свои заметки и действия. Пользователи не видят данные друг друга; администратор управляет списком аккаунтов, но чужие книги и заметки ему тоже не видны.
+## Limitations & roadmap
 
-Новый профиль пустой. Имя берётся из того, что человек указал при регистрации, а сильные стороны, цели и фокус он заполняет сам — умолчаний, придуманных за него, нет. Имя из профиля — это же имя в шапке страницы, в письмах и в экспортируемых документах; очистка поля возвращает логин. Переименовать аккаунт можно и из консоли: `python server.py rename <логин> <имя>`.
+- PDFs need a text layer — no OCR yet.
+- Search is a full library scan; fine up to tens of thousands of chunks, then a vector index (pgvector / sqlite-vec) is needed.
+- Next: PostgreSQL + pgvector, indexing queue as a separate worker, OCR, hybrid search + reranking, team roles.
 
-Первый аккаунт создаётся автоматически при первом запуске из `NBRAIN_ADMIN_USERNAME` (по умолчанию `admin`) и `NBRAIN_ADMIN_PASSWORD` и получает права администратора. Логин остаётся латиницей, а видимое имя задаётся отдельно в `NBRAIN_ADMIN_DISPLAY_NAME` — например `Цэцэглэн`. База, созданная прежней однопользовательской версией, переносится на него целиком — книги, каталог, профиль, заметки и действия остаются на месте, а прежний пароль продолжает работать. Форма входа теперь спрашивает логин, но запрос с одним паролем по-прежнему открывает основной аккаунт.
+## About
 
-Остальные пользователи регистрируются сами: на странице входа есть вкладка
-«Регистрация» по адресу почты и паролю. Отключить самостоятельную регистрацию
-можно переменной `NBRAIN_REGISTRATION_OPEN=0`. Администратор может создать
-аккаунт вручную в разделе «Профиль» → «Пользователи» или из терминала:
+Built by [Tsetseglen B.](https://github.com/tsetseglenb0310-spec) — Information
+Systems Manager at a manufacturing company in Ulaanbaatar, Mongolia.
+I started this project with no programming background and built it
+iteratively with AI coding assistants (Claude, Codex), reviewing and
+understanding every change before shipping it. The result runs in production at
+[app.nbrain-ts.org](https://app.nbrain-ts.org).
 
-```powershell
-python server.py users
-python server.py adduser anna "длинный-пароль" --name "Анна Иванова" [--admin]
-python server.py passwd anna "новый-длинный-пароль"
-python server.py backup
-```
-
-После регистрации на почту уходит письмо со ссылкой подтверждения, а на первом
-входе открывается короткая анкета: темы, навыки, цели, прочитанные и желаемые
-книги, время на занятия в день, целевая дата и предпочитаемый формат. Анкету
-можно пропустить и заполнить позже — ответы лежат в разделе «Профиль».
-
-**Пока SMTP не настроен, письма не отправляются, а записываются в журнал.**
-Регистрация, подтверждение адреса и восстановление пароля при этом работают:
-администратор открывает `GET /api/admin/mail-log` и передаёт ссылку вручную.
-Как настроить отправку — в `.env.example` и `RENDER_DEPLOY.md`.
-
-Каждый может выгрузить все свои данные одним файлом («Профиль» → «Ваши данные»)
-и удалить аккаунт, подтвердив пароль. Удаление стирает книги вместе с файлами на
-диске; последнего администратора удалить нельзя.
-
-Пароли хранятся как PBKDF2-SHA256 с индивидуальной солью, а не в открытом виде. Cookie подписывается отпечатком пароля владельца, поэтому смена пароля закрывает сессии только этого аккаунта. Удаление аккаунта удаляет его книги вместе с файлами на диске; последнего администратора и аккаунт, под которым вы вошли, удалить нельзя.
-
-## Личная облачная версия
-
-Приложение подготовлено к запуску в Docker с личным паролем. Перед размещением в интернете создайте файл `.env` рядом с `docker-compose.yml` (он исключён и из Git, и из Docker-контекста через `.dockerignore`) и заполните: `OPENAI_API_KEY`, `NBRAIN_ADMIN_PASSWORD` и `NBRAIN_SESSION_SECRET`. Контейнер получает эти значения переменными окружения — из `docker-compose.yml` или из панели Render, — а не из файла внутри образа.
-
-```powershell
-docker compose up -d --build
-```
-
-Для публичного доступа нужен HTTPS-домен и обратный прокси. Установите `NBRAIN_SECURE_COOKIES=1` только при работе через HTTPS. Не публикуйте текущий сервер напрямую в интернет без пароля и HTTPS.
-
-С `NBRAIN_AUTH_REQUIRED=0` каждый запрос считается основным аккаунтом и не требует cookie. Это удобно на своём компьютере и недопустимо в интернете, поэтому сервер отказывается стартовать в этом режиме, если слушает не loopback.
-
-Дорогие операции ограничены квотой на аккаунт: ответы модели, поиск, загрузка книг, экспорт и смена пароля. Значения задаются переменными `NBRAIN_RATE_*`; при исчерпании квоты запрос отклоняется с указанием, когда повторить.
-
-Резервная копия базы делается командой `python server.py backup` — она работает на живом сервисе и кладёт файл в `data/backups/`. Копируйте её вместе с `data/uploads`, где лежат исходные файлы книг.
-
-Пароль может содержать кириллицу и любые символы Unicode. Смена пароля аккаунта немедленно завершает ранее открытые сессии этого аккаунта. После нескольких неверных попыток вход замедляется, после десяти — блокируется на 15 минут для этого адреса.
-
-Адрес для блокировки берётся из сокета. Заголовок `X-Forwarded-For` учитывается только тогда, когда ему разрешено доверять, иначе клиент подставлял бы новое значение на каждую попытку и обходил блокировку:
-
-- `NBRAIN_TRUSTED_PROXIES` — список адресов прокси через запятую (nginx, HAProxy на своём сервере);
-- `NBRAIN_TRUST_FORWARDED_FOR=1` — доверять заголовку от любого пира. Так можно ставить только на площадках, где до сервиса физически нельзя достучаться мимо их прокси (Render, Fly, Cloud Run).
-
-По умолчанию оба выключены.
-
-## Следующий технический шаг
-
-После личной облачной версии: PostgreSQL + pgvector, вынос очереди индексации из процесса в отдельный воркер, OCR, hybrid search, reranking и роли для команды.
+License: MIT.
