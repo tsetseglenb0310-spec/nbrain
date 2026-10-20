@@ -157,6 +157,17 @@ server.set_user_password(AID, "НовыйПарольАнны-2026")
 check("смена пароля инвалидирует cookie этого аккаунта",
       not server.session_is_valid(f"nbrain_session={anna_token}"))
 check("cookie другого аккаунта при этом жива", server.session_is_valid(f"nbrain_session={token}"))
+anna_token = server.make_session_token(server.get_user(AID))
+check("смена логина возвращает новый логин в нижнем регистре",
+      server.set_username(AID, "Anna.New")["username"] == "anna.new")
+check("после смены логина вход по новому логину находит тот же аккаунт",
+      (server.find_user("anna.new") or {}).get("id") == AID and server.find_user("anna") is None)
+check("смена логина не закрывает сессию", server.session_is_valid(f"nbrain_session={anna_token}"))
+check("занятый логин отклоняется", raises(server.set_username, AID, OWNER["username"]))
+check("свой же логин принимается повторно", server.set_username(AID, "anna.new")["username"] == "anna.new")
+check("некорректный логин при смене отклоняется", raises(server.set_username, AID, "Анна"))
+check("смена логина несуществующего аккаунта -> ClientError", raises(server.set_username, "нет-такого", "whoever"))
+server.set_username(AID, "anna")
 check("удалить аккаунт, под которым вошли, нельзя", raises(server.delete_user, UID, UID))
 check("удалить последнего администратора нельзя",
       raises(server.delete_user, UID, AID))

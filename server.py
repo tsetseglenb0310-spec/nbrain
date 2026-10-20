@@ -1994,6 +1994,26 @@ def set_user_password(user_id: str, password: str) -> dict[str, Any]:
     return {"id": user_id, "password_changed": True}
 
 
+def set_username(user_id: str, username: str) -> dict[str, Any]:
+    """Change the login of an account; sessions and data stay as they are.
+
+    Everything owned by the account hangs off its id, not its login, and the
+    session cookie is signed with the id and the password fingerprint, so a
+    renamed account stays signed in and keeps every book, note and plan.
+    """
+    username = normalize_username(username)
+    if not USERNAME_RE.fullmatch(username):
+        raise ClientError("Логин: 3–32 символа, латиница, цифры, точка, дефис или подчёркивание.")
+    with db() as conn:
+        taken = conn.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
+        if taken and str(taken["id"]) != str(user_id):
+            raise ClientError("Такой логин уже занят.")
+        updated = conn.execute("UPDATE users SET username = ? WHERE id = ?", (username, str(user_id))).rowcount
+    if not updated:
+        raise ClientError("Пользователь не найден.")
+    return {"id": user_id, "username": username}
+
+
 def export_user_data(user_id: str) -> dict[str, Any]:
     """Everything this account owns, as one JSON document it can keep.
 
@@ -5671,8 +5691,9 @@ def run_cli(argv: list[str]) -> None:
     `python server.py users` lists the accounts, `python server.py adduser
     <логин> <пароль> [--admin] [--name Имя]` creates one, `python server.py
     rename <логин> <имя>` changes the name shown in the interface,
-    `python server.py passwd <логин> <пароль>` resets a forgotten password and
-    `python server.py backup [путь]` writes a consistent copy of the database.
+    `python server.py passwd <логин> <пароль>` resets a forgotten password,
+    `python server.py login <старый логин> <новый логин>` changes the login
+    and `python server.py backup [путь]` writes a consistent copy of the database.
     """
     init_storage()
     command = argv[0]
@@ -5723,8 +5744,17 @@ def run_cli(argv: list[str]) -> None:
         set_user_password(user["id"], argv[2])
         print(f"Пароль аккаунта «{user['username']}» изменён; его прежние сессии закрыты.")
         return
+    if command == "login":
+        if len(argv) < 3:
+            raise SystemExit("Использование: python server.py login <старый логин> <новый логин>")
+        user = find_user(argv[1])
+        if not user:
+            raise SystemExit(f"Аккаунт «{argv[1]}» не найден.")
+        result = set_username(user["id"], argv[2])
+        print(f"Логин аккаунта «{user['username']}» теперь «{result['username']}»; пароль и данные не изменились.")
+        return
     raise SystemExit(
-        f"Неизвестная команда «{command}». Доступны: users, adduser, rename, passwd, backup."
+        f"Неизвестная команда «{command}». Доступны: users, adduser, rename, passwd, login, backup."
     )
 
 
