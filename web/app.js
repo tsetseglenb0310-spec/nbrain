@@ -1083,7 +1083,7 @@ document.querySelectorAll('.prompt-chips button').forEach((button) => {
 function renderSources(sources) {
   sourceList.innerHTML = sources.map((source, index) => `
     <article id="source-${index + 1}" class="source-card">
-      <div class="source-topline"><strong>[S${index + 1}] ${escapeHtml(source.title)}</strong><span>${formatPages(source)}</span></div>
+      <div class="source-topline"><strong>[S${index + 1}] ${escapeHtml(source.title)}</strong><span>${source.chapter ? `${escapeHtml(source.chapter)} · ` : ''}${formatPages(source)}</span></div>
       <p>${escapeHtml(source.content)}</p>
       <small>${source.source_kind === 'overview' ? 'Фрагмент для целостного охвата книги' : `Релевантность: ${Math.round(source.score * 100)}%`}</small>
     </article>

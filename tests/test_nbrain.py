@@ -278,8 +278,9 @@ check("поиск возвращает результаты", len(results) == 3,
 check("у результата есть текст фрагмента", bool(results[0].get("content")))
 check("у результата есть название книги", results[0].get("title") == "Стратегия")
 check("оценки в разумном диапазоне", all(-1.01 <= r["score"] <= 1.01 for r in results))
-check("оценки отсортированы по убыванию",
-      all(results[i]["score"] >= results[i + 1]["score"] for i in range(len(results) - 1)))
+check("результаты отсортированы по объединённой оценке",
+      all(results[i]["rank_score"] >= results[i + 1]["rank_score"] for i in range(len(results) - 1)))
+check("у результата есть поле главы (пустое для текста без заголовков)", results[0].get("chapter") == "")
 
 print("\n=== 6. Thinker: один эмбеддинг вместо N ===")
 book2 = server.UPLOADS_DIR / "b2_team.txt"
@@ -947,6 +948,152 @@ with server.db() as conn:
 check("после миграции чужого имени нет ни в одном аккаунте", left == 0)
 server.purge_user(FRESH_ID)
 server.purge_user(FILLED["id"])
+
+print("\n=== Чанкинг по абзацам, предложениям и главам ===")
+sentences = server.split_sentences('Первое предложение. Второе! Третье? «Четвёртое.» Пятое… шестое строчное. 7 цифра.')
+check("предложения режутся по .!?… с заглавной буквы дальше",
+      sentences == ['Первое предложение.', 'Второе!', 'Третье?', '«Четвёртое.»', 'Пятое… шестое строчное.', '7 цифра.'],
+      f"({sentences})")
+chapter_text = (
+    "Глава 1. Начало\n\n"
+    + " ".join(f"Предложение номер {i} говорит о стратегии компании." for i in range(1, 60))
+    + "\n\nВторой абзац короткий. Он про людей.\n\n"
+)
+chapter_text2 = (
+    "Глава 2. Продолжение\n\n"
+    + " ".join(f"Фраза {i} рассказывает про делегирование и доверие." for i in range(1, 40))
+    + "\n\nХвостик главы."
+)
+chapter_pages = [(1, chapter_text), (2, chapter_text2)]
+found = server.detect_text_chapters(chapter_pages)
+check("заголовки «Глава N» найдены с номером абзаца",
+      found == [(1, 0, "Глава 1. Начало"), (2, 0, "Глава 2. Продолжение")], f"({found})")
+check("слово «глава» внутри предложения не считается заголовком",
+      server.detect_text_chapters([(1, "В этой главе 3 раза упомянута глава 5 как пример.")]) == [])
+check("английские заголовки тоже распознаются",
+      server.detect_text_chapters([(4, "Intro\n\nChapter IV: The Plan\n\ntext")]) == [(4, 1, "Chapter IV: The Plan")])
+chunks = server.make_chunks(chapter_pages, size=120, overlap=30, chapters=found)
+check("каждый чанк заканчивается концом предложения",
+      all(c["content"].rstrip()[-1] in ".!?…»\"" for c in chunks), f"({[c['content'][-20:] for c in chunks]})")
+check("чанк не выходит за лимит слов", all(server.word_count(c["content"]) <= 120 for c in chunks))
+check("чанки первой главы помечены её названием, второй — своим",
+      {c["chapter"] for c in chunks if c["page_from"] == 1} == {"Глава 1. Начало"}
+      and {c["chapter"] for c in chunks if c["page_from"] == 2} == {"Глава 2. Продолжение"})
+second_chapter = [c for c in chunks if c["chapter"] == "Глава 2. Продолжение"]
+check("вторая глава начинается с нового чанка и с заголовка",
+      second_chapter and second_chapter[0]["content"].startswith("Глава 2. Продолжение"))
+check("чанки не пересекают границу главы", all(c["page_from"] == c["page_to"] for c in chunks))
+first_sentence_of_second = chunks[1]["content"].split(".")[0] + "."
+check("перекрытие — целые предложения из конца предыдущего чанка",
+      first_sentence_of_second in chunks[0]["content"] and chunks[0]["content"].endswith("."), f"({first_sentence_of_second})")
+check("короткий хвост главы присоединён к предыдущему чанку",
+      chunks[-1]["content"].endswith("Хвостик главы.") and server.word_count(chunks[-1]["content"]) > server.MIN_CHUNK_WORDS)
+check("порядковые номера идут подряд", [c["ordinal"] for c in chunks] == list(range(1, len(chunks) + 1)))
+giant = " ".join(f"слово{i}" for i in range(1000))
+giant_chunks = server.make_chunks([(1, giant)], size=300, overlap=50)
+check("предложение без знаков препинания режется по словам в пределах лимита",
+      len(giant_chunks) >= 4 and all(server.word_count(c["content"]) <= 300 for c in giant_chunks), f"({len(giant_chunks)})")
+check("слова при этом не теряются",
+      " ".join(giant_chunks[0]["content"].split()[:300]) == " ".join(f"слово{i}" for i in range(300)))
+check("крошечный документ — один чанк без главы",
+      server.make_chunks([(1, "Одно предложение.")]) == [{"ordinal": 1, "page_from": 1, "page_to": 1, "chapter": "", "content": "Одно предложение."}])
+check("пустой документ -> ClientError", raises(server.make_chunks, [(1, "   ")]))
+multi_page = [(1, "Абзац на первой странице. " * 30), (2, "Абзац на второй странице. " * 30)]
+spanning = server.make_chunks(multi_page, size=450, overlap=70)
+check("без глав чанк может охватывать две страницы", len(spanning) == 1 and spanning[0]["page_from"] == 1 and spanning[0]["page_to"] == 2)
+
+print("\n=== Главы из EPUB и оглавления PDF ===")
+check("заголовок h1 EPUB очищается от тегов", server.html_heading("<h1>Глава <b>1</b>.&nbsp;Старт</h1>") == "Глава 1. Старт")
+check("без h1 берётся <title>", server.html_heading("<title>Введение</title><p>x</p>") == "Введение")
+check("без заголовков — пустая строка", server.html_heading("<p>просто текст</p>") == "")
+epub_pages, epub_chapters = server.read_epub_document(epub_path)
+check("каждый документ spine — граница главы",
+      [c[:2] for c in epub_chapters] == [(1, 0), (2, 0), (3, 0)] and len(epub_pages) == 3, f"({epub_chapters})")
+
+
+class FakeDest:
+    def __init__(self, title, page):
+        self.title, self.page = title, page
+
+
+class FakeReader:
+    def __init__(self, outline):
+        self.outline = outline
+
+    def get_destination_page_number(self, item):
+        return item.page
+
+
+flat = FakeReader([FakeDest("Введение", 0), FakeDest("Глава 1", 4), [FakeDest("1.1 Подраздел", 5)], FakeDest("Глава 2", 9)])
+check("оглавление PDF: верхний уровень, страницы с 1",
+      server.pdf_outline_chapters(flat) == [(1, 0, "Введение"), (5, 0, "Глава 1"), (10, 0, "Глава 2")],
+      f"({server.pdf_outline_chapters(flat)})")
+nested = FakeReader([FakeDest("Книга", 0), [FakeDest("Глава 1", 0), FakeDest("Глава 2", 7)]])
+check("одна корневая запись — берутся вложенные главы",
+      server.pdf_outline_chapters(nested) == [(1, 0, "Книга"), (8, 0, "Глава 2")], f"({server.pdf_outline_chapters(nested)})")
+
+
+class BrokenReader:
+    @property
+    def outline(self):
+        raise ValueError("damaged")
+
+
+check("повреждённое оглавление не роняет книгу", server.pdf_outline_chapters(BrokenReader()) == [])
+
+print("\n=== Гибридный поиск: FTS5 + векторы ===")
+check("в этой сборке SQLite есть FTS5", server.fts5_available())
+check("запрос с кавычками и операторами безопасен",
+      server.fts_query('Что такое "делегирование" AND (доверие) - NOT x?')
+      == '"что" OR "такое" OR "делегирование" OR "делегирован"* OR "and" OR "доверие" OR "довер"* OR "not"',
+      f"({server.fts_query('Что такое ' + chr(34) + 'делегирование' + chr(34) + ' AND (доверие) - NOT x?')})")
+check("пустой запрос даёт пустую строку", server.fts_query("?!  ") == "")
+check("повторы терминов схлопываются", server.fts_query("план план плана") == '"план" OR "плана"')
+rare_path = server.UPLOADS_DIR / "b3_rare.txt"
+filler = ["Руководитель планирует неделю и распределяет задачи по приоритетам. " * 25,
+          "Команда обсуждает результаты квартала и уточняет цели. " * 25,
+          "В этом абзаце встречается редкое слово Квазимодо, и больше нигде в книге его нет. " + "Совещание закончилось вовремя. " * 24,
+          "Финансовый отчёт показывает рост выручки и снижение издержек. " * 25,
+          "Заключение подводит итоги и предлагает следующие шаги. " * 25]
+rare_path.write_text("\n\n".join(filler), encoding="utf-8")
+with server.db() as conn:
+    conn.execute(
+        "INSERT INTO books (id, user_id, filename, title, extension, stored_path, status, created_at) VALUES (?,?,?,?,?,?,?,?)",
+        ("b9", UID, "rare.txt", "Редкое", ".txt", str(rare_path), "queued", server.now_iso()),
+    )
+server.start_indexing("b9", rare_path)
+check("книга с редким словом проиндексирована", wait_ready("b9")[0] == "ready")
+with server.db() as conn:
+    chunk_total = conn.execute("SELECT COUNT(*) AS n FROM chunks WHERE book_id = 'b9'").fetchone()["n"]
+    fts_total = conn.execute("SELECT COUNT(*) AS n FROM chunks_fts WHERE book_id = 'b9'").fetchone()["n"]
+check("у книги несколько чанков", chunk_total >= 2, f"({chunk_total})")
+check("текстовый индекс заполнен триггером на каждый чанк", fts_total == chunk_total, f"({fts_total} vs {chunk_total})")
+hits = server.search(UID, "Квазимодо", limit=3, book_ids=["b9"])
+check("точное редкое слово находится первым, хотя эмбеддинги случайны",
+      hits and "Квазимодо" in hits[0]["content"] and hits[0]["matched_text"] is True,
+      f"({[h['content'][:40] for h in hits]})")
+check("оценка косинуса сохранена отдельно от объединённой", -1.01 <= hits[0]["score"] <= 1.01 and hits[0]["rank_score"] > 0)
+check("чанк, найденный только векторами, помечен matched_text=False",
+      any(h["matched_text"] is False for h in hits))
+stemmed = server.search(UID, "приоритетами распределяет", limit=2, book_ids=["b9"])
+check("словоформа находится по префиксу", stemmed and "приоритетам" in stemmed[0]["content"])
+server.HYBRID_SEARCH = False
+vector_only = server.search(UID, "Квазимодо", limit=3, book_ids=["b9"])
+check("с выключенным гибридом поиск работает на одних векторах",
+      len(vector_only) == 3 and not any(h["matched_text"] for h in vector_only))
+server.HYBRID_SEARCH = True
+check("реиндексация сохраняет соответствие текстового индекса",
+      server.reindex_book(UID, "b9")["status"] == "queued" and wait_ready("b9")[0] == "ready")
+with server.db() as conn:
+    chunk_total = conn.execute("SELECT COUNT(*) AS n FROM chunks WHERE book_id = 'b9'").fetchone()["n"]
+    fts_total = conn.execute("SELECT COUNT(*) AS n FROM chunks_fts WHERE book_id = 'b9'").fetchone()["n"]
+check("после реиндексации нет осиротевших строк FTS", fts_total == chunk_total, f"({fts_total} vs {chunk_total})")
+server.delete_book(UID, "b9")
+with server.db() as conn:
+    fts_total = conn.execute("SELECT COUNT(*) AS n FROM chunks_fts WHERE book_id = 'b9'").fetchone()["n"]
+check("удаление книги очищает текстовый индекс через каскад", fts_total == 0, f"({fts_total})")
+check("слияние рангов: элемент из обоих списков выше, чем из одного",
+      server.rrf_fuse([["a", "b"], ["b", "c"]])[0][0] == "b")
 
 print("\n=== Повторы запросов к OpenAI и Claude ===")
 

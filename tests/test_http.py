@@ -99,6 +99,15 @@ check("значения вектора сохранены при конверт�
       all(abs(a - b) < 1e-5 for a, b in zip(migrated, expected)))
 check("повторный запуск миграции ничего не ломает",
       (server.migrate_embeddings_to_blob() or True))
+with server.db() as conn:
+    fts_rows = conn.execute("SELECT COUNT(*) AS n FROM chunks_fts").fetchone()["n"]
+    chapter_column = "chapter" in {r["name"] for r in conn.execute("PRAGMA table_info(chunks)")}
+check("текстовый индекс FTS5 построен по старым фрагментам", fts_rows == 4, f"({fts_rows})")
+check("у старой таблицы chunks появилась колонка chapter", chapter_column)
+server.ensure_fts_index()
+with server.db() as conn:
+    fts_rows_again = conn.execute("SELECT COUNT(*) AS n FROM chunks_fts").fetchone()["n"]
+check("повторная инициализация не дублирует текстовый индекс", fts_rows_again == 4, f"({fts_rows_again})")
 
 server.resume_interrupted_indexing()
 
@@ -178,6 +187,7 @@ check("в ответе есть флаг indexing", "indexing" in payload["books
 
 status, payload, _ = call("GET", "/api/health", cookie=session)
 check("health с сессией показывает бэкенд векторов", payload.get("vector_backend") == "numpy", f"({payload})")
+check("health сообщает, что текстовый поиск включён", payload.get("text_search") is True, f"({payload})")
 
 print("\n--- загрузка книги ---")
 content = ("Делегирование освобождает время руководителя. " * 500).encode()

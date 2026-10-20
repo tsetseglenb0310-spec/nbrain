@@ -175,6 +175,15 @@ API_RETRIES = max(0, int(os.environ.get("NBRAIN_API_RETRIES", "4")))
 API_RETRY_BASE_SECONDS = max(0.0, float(os.environ.get("NBRAIN_API_RETRY_BASE", "1.5")))
 API_RETRY_MAX_SECONDS = 60.0
 RETRYABLE_HTTP_STATUSES = {408, 409, 429, 500, 502, 503, 504}
+# Hybrid retrieval: cosine similarity over embeddings plus BM25 over an FTS5
+# index of the same chunks, fused by reciprocal rank. Embeddings alone miss
+# exact terms, names and numbers; BM25 alone misses paraphrase. Off means
+# vectors only, which is also what happens when SQLite was built without FTS5.
+HYBRID_SEARCH = env_flag("NBRAIN_HYBRID_SEARCH", True)
+RRF_K = 60
+# A chunk shorter than this at the end of a chapter is folded into the
+# previous one: a three-line fragment makes a poor search hit and a poor source.
+MIN_CHUNK_WORDS = 40
 # Brute-force protection for the single-password login.
 LOGIN_FREE_ATTEMPTS = 3
 LOGIN_MAX_DELAY_SECONDS = 60.0
@@ -784,6 +793,7 @@ def init_storage() -> None:
                 page_from INTEGER,
                 page_to INTEGER,
                 content TEXT NOT NULL,
+                chapter TEXT NOT NULL DEFAULT '',
                 embedding_json TEXT NOT NULL DEFAULT '',
                 embedding_vec BLOB,
                 embedding_model TEXT NOT NULL DEFAULT 'unknown',
@@ -853,6 +863,78 @@ def init_storage() -> None:
         conn.executescript(USER_SCOPED_INDEXES_SQL)
         conn.execute("PRAGMA journal_mode = WAL")
     migrate_embeddings_to_blob()
+    ensure_fts_index()
+
+
+_fts5_support: bool | None = None
+_fts_ready = False
+
+
+def fts5_available() -> bool:
+    """Whether this SQLite build has the FTS5 extension compiled in."""
+    global _fts5_support
+    if _fts5_support is None:
+        probe = sqlite3.connect(":memory:")
+        try:
+            probe.execute("CREATE VIRTUAL TABLE probe USING fts5(x)")
+            _fts5_support = True
+        except sqlite3.OperationalError:
+            _fts5_support = False
+        finally:
+            probe.close()
+    return _fts5_support
+
+
+FTS_SCHEMA_SQL = """
+    CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+        chunk_id UNINDEXED, book_id UNINDEXED, content,
+        tokenize='unicode61 remove_diacritics 2'
+    );
+    CREATE TRIGGER IF NOT EXISTS chunks_fts_ai AFTER INSERT ON chunks BEGIN
+        INSERT INTO chunks_fts (chunk_id, book_id, content) VALUES (new.id, new.book_id, new.content);
+    END;
+    CREATE TRIGGER IF NOT EXISTS chunks_fts_ad AFTER DELETE ON chunks BEGIN
+        DELETE FROM chunks_fts WHERE chunk_id = old.id;
+    END;
+    CREATE TRIGGER IF NOT EXISTS chunks_fts_au AFTER UPDATE OF content ON chunks BEGIN
+        UPDATE chunks_fts SET content = new.content WHERE chunk_id = old.id;
+    END;
+"""
+
+
+def ensure_fts_index() -> bool:
+    """Create the BM25 side of hybrid search and fill it from existing chunks.
+
+    Not a numbered migration on purpose: FTS5 depends on how SQLite was
+    built, and a step recorded as applied on a build without it would never
+    run again on a build with it. This is idempotent and cheap once the index
+    exists. Triggers keep it in step with `chunks` on every path — indexing,
+    reindexing, deleting a book, purging an account — including the rows that
+    foreign-key cascades delete.
+    """
+    global _fts_ready
+    if not fts5_available():
+        _fts_ready = False
+        print("SQLite has no FTS5: search runs on embeddings only.", file=sys.stderr)
+        return False
+    with db() as conn:
+        conn.executescript(FTS_SCHEMA_SQL)
+        missing = conn.execute(
+            "SELECT COUNT(*) AS n FROM chunks WHERE id NOT IN (SELECT chunk_id FROM chunks_fts)"
+        ).fetchone()["n"]
+        if missing:
+            conn.execute(
+                """INSERT INTO chunks_fts (chunk_id, book_id, content)
+                   SELECT id, book_id, content FROM chunks
+                   WHERE id NOT IN (SELECT chunk_id FROM chunks_fts)"""
+            )
+            print(f"Built the text index for {missing} existing chunk(s).")
+    _fts_ready = True
+    return True
+
+
+def text_search_enabled() -> bool:
+    return HYBRID_SEARCH and _fts_ready
 
 
 OWNED_TABLES = ("books", "memories", "action_items", "development_books")
@@ -1267,11 +1349,19 @@ def migrate_clean_seeded_profiles(conn: Any) -> None:
 # Ordered, applied once, recorded in schema_migrations. Never edit a step that
 # has already shipped: add a new one instead, or an installation that already
 # ran the old version will never see the change.
+def migrate_chunk_chapters(conn: Any) -> None:
+    """Chunks remember the chapter they come from, for sources and prompts."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(chunks)")}
+    if "chapter" not in columns:
+        conn.execute("ALTER TABLE chunks ADD COLUMN chapter TEXT NOT NULL DEFAULT ''")
+
+
 MIGRATIONS: list[tuple[str, Any]] = [
     ("001_multi_user", migrate_to_multi_user),
     ("002_accounts", migrate_accounts),
     ("003_learning", migrate_learning),
     ("004_clean_seeded_profiles", migrate_clean_seeded_profiles),
+    ("005_chunk_chapters", migrate_chunk_chapters),
 ]
 
 
@@ -2098,7 +2188,73 @@ def normalize_text(text: str) -> str:
     return text.strip()
 
 
-def read_pdf(path: Path) -> list[tuple[int, str]]:
+# A chapter start is (page_no, paragraph_index, title): the paragraph on that
+# page where the chapter begins. Chunks never cross one of these points.
+Chapter = tuple[int, int, str]
+
+CHAPTER_HEADING_RE = re.compile(
+    r"^\s*(?:глава|часть|раздел|книга|chapter|part|section|book)\s+(?:\d+|[ivxlc]+)\b[^\n]{0,120}$",
+    re.IGNORECASE,
+)
+
+
+def split_paragraphs(text: str) -> list[str]:
+    return [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
+
+
+def detect_text_chapters(pages: list[tuple[int, str]]) -> list[Chapter]:
+    """Find chapter headings in the text itself, for files without an outline.
+
+    Only explicit headings count ("Глава 3", "Chapter IV", "Часть 2"): an
+    all-caps line or a short line is far too often a quote, a list item or a
+    page header, and a false chapter boundary is worse than none.
+    """
+    chapters: list[Chapter] = []
+    for page_no, text in pages:
+        for index, paragraph in enumerate(split_paragraphs(text)):
+            for line in paragraph.split("\n"):
+                if CHAPTER_HEADING_RE.match(line):
+                    chapters.append((page_no, index, re.sub(r"\s+", " ", line).strip()[:160]))
+                    break
+    return chapters
+
+
+def pdf_outline_chapters(reader: Any) -> list[Chapter]:
+    """Chapter starts from the PDF outline (the bookmarks panel in a viewer)."""
+    try:
+        outline = reader.outline
+    except Exception:  # noqa: BLE001 - a damaged outline is not worth failing the book
+        return []
+
+    def collect(items: Any, depth: int, max_depth: int) -> list[Chapter]:
+        found: list[Chapter] = []
+        for item in items or []:
+            if isinstance(item, list):
+                if depth < max_depth:
+                    found.extend(collect(item, depth + 1, max_depth))
+                continue
+            try:
+                page_no = int(reader.get_destination_page_number(item)) + 1
+                title = re.sub(r"\s+", " ", str(getattr(item, "title", "") or "")).strip()
+            except Exception:  # noqa: BLE001 - one broken bookmark should not drop the rest
+                continue
+            if page_no >= 1:
+                found.append((page_no, 0, title[:160]))
+        return found
+
+    chapters = collect(outline, 0, 0)
+    if len(chapters) < 2:
+        # A single top-level entry (the book title) with the chapters nested under it.
+        chapters = collect(outline, 0, 1)
+    # Two bookmarks on one page (the book title and its first chapter) keep
+    # the one that comes first in the outline.
+    by_page: dict[int, Chapter] = {}
+    for chapter in chapters:
+        by_page.setdefault(chapter[0], chapter)
+    return [by_page[page] for page in sorted(by_page)]
+
+
+def read_pdf_document(path: Path) -> tuple[list[tuple[int, str]], list[Chapter]]:
     reader = PdfReader(str(path))
     pages: list[tuple[int, str]] = []
     for number, page in enumerate(reader.pages, start=1):
@@ -2107,7 +2263,13 @@ def read_pdf(path: Path) -> list[tuple[int, str]]:
             pages.append((number, text))
     if not pages:
         raise ClientError("В PDF не найден текст. Для скана сначала нужен OCR.")
-    return pages
+    present = {page_no for page_no, _ in pages}
+    chapters = [chapter for chapter in pdf_outline_chapters(reader) if chapter[0] in present]
+    return pages, chapters or detect_text_chapters(pages)
+
+
+def read_pdf(path: Path) -> list[tuple[int, str]]:
+    return read_pdf_document(path)[0]
 
 
 TXT_WORDS_PER_PAGE = 400
@@ -2223,8 +2385,28 @@ def epub_reading_order(archive: zipfile.ZipFile) -> list[str]:
     return ordered
 
 
-def read_epub(path: Path) -> list[tuple[int, str]]:
+def html_heading(html: str) -> str:
+    """The first h1–h3 of an EPUB document, else its <title>, as plain text."""
+    match = re.search(r"<h[1-3][^>]*>(.*?)</h[1-3]>", html, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return ""
+    # Inline tags (<b>, <span>) vanish rather than becoming spaces, so
+    # "Глава <b>1</b>." reads "Глава 1." and not "Глава 1 ."
+    text = unescape(re.sub(r"<[^>]+>", "", match.group(1)))
+    return re.sub(r"\s+", " ", text).strip()[:160]
+
+
+def read_epub_document(path: Path) -> tuple[list[tuple[int, str]], list[Chapter]]:
+    """Pages in spine order; every spine document is a chapter boundary.
+
+    Publishers split EPUBs by chapter or section, so the document boundary is
+    the best chapter boundary available. A document without a heading keeps
+    the previous title but still starts its own chunks.
+    """
     pages: list[tuple[int, str]] = []
+    chapters: list[Chapter] = []
     with zipfile.ZipFile(path) as archive:
         guard_zip_archive(archive, "EPUB")
         document_names = epub_reading_order(archive)
@@ -2234,6 +2416,7 @@ def read_epub(path: Path) -> list[tuple[int, str]]:
                 name for name in archive.namelist()
                 if name.lower().endswith((".xhtml", ".html", ".htm"))
             )
+        title = ""
         for number, name in enumerate(document_names, start=1):
             html = archive.read(name).decode("utf-8", errors="ignore")
             text = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", html, flags=re.IGNORECASE | re.DOTALL)
@@ -2241,53 +2424,155 @@ def read_epub(path: Path) -> list[tuple[int, str]]:
             text = normalize_text(unescape(text))
             if text:
                 pages.append((number, text))
+                title = html_heading(html) or title
+                chapters.append((number, 0, title))
     if not pages:
         raise ClientError("В EPUB не найден текст.")
-    return pages
+    return pages, chapters
 
 
-def extract_pages(path: Path) -> list[tuple[int, str]]:
+def read_epub(path: Path) -> list[tuple[int, str]]:
+    return read_epub_document(path)[0]
+
+
+def extract_document(path: Path) -> tuple[list[tuple[int, str]], list[Chapter]]:
+    """Pages of the book plus the chapter starts found in it."""
     extension = path.suffix.lower()
     if extension == ".pdf":
-        return read_pdf(path)
+        return read_pdf_document(path)
     if extension == ".txt":
-        return read_txt(path)
+        pages = read_txt(path)
+        return pages, detect_text_chapters(pages)
     if extension == ".epub":
-        return read_epub(path)
+        return read_epub_document(path)
     raise ClientError("Поддерживаются PDF, EPUB и TXT.")
 
 
-def word_items(pages: list[tuple[int, str]]) -> list[tuple[int, str]]:
-    items: list[tuple[int, str]] = []
-    for page, text in pages:
-        items.extend((page, word) for word in re.findall(r"\S+", text))
-    return items
+def extract_pages(path: Path) -> list[tuple[int, str]]:
+    return extract_document(path)[0]
 
 
-def make_chunks(pages: list[tuple[int, str]], size: int = CHUNK_WORDS, overlap: int = CHUNK_OVERLAP) -> list[dict[str, Any]]:
-    """Create small, page-aware chunks with a limited word overlap."""
-    items = word_items(pages)
-    if not items:
-        raise ClientError("В документе нет текста для индексации.")
+# A sentence ends at .!?… optionally followed by one closing quote or bracket,
+# and the next one starts with a capital letter or a digit, optionally after an
+# opening quote. Lowercase after a full stop ("т. е.", "и т. д.") is not a break.
+SENTENCE_BOUNDARY_RE = re.compile(
+    r"(?:(?<=[.!?…])|(?<=[.!?…][»”\"')\]]))\s+(?=[«\"“(\[]?[A-ZА-ЯЁ0-9])"
+)
+
+
+def split_sentences(text: str) -> list[str]:
+    flat = re.sub(r"\s+", " ", text).strip()
+    if not flat:
+        return []
+    return [part.strip() for part in SENTENCE_BOUNDARY_RE.split(flat) if part.strip()]
+
+
+def word_count(text: str) -> int:
+    return len(text.split())
+
+
+def chunk_units(paragraph: str, size: int) -> list[str]:
+    """Pieces of a paragraph that each fit in a chunk, cut as gently as possible.
+
+    A paragraph that fits stays whole. One that does not is cut between
+    sentences; a sentence longer than a whole chunk (a table turned into text,
+    a list without punctuation) is the only thing ever cut between words.
+    """
+    if word_count(paragraph) <= size:
+        return [paragraph]
+    units: list[str] = []
+    for sentence in split_sentences(paragraph):
+        words = sentence.split()
+        if len(words) <= size:
+            units.append(sentence)
+            continue
+        for start in range(0, len(words), size):
+            units.append(" ".join(words[start : start + size]))
+    return units
+
+
+def make_chunks(
+    pages: list[tuple[int, str]],
+    size: int = CHUNK_WORDS,
+    overlap: int = CHUNK_OVERLAP,
+    chapters: list[Chapter] | None = None,
+) -> list[dict[str, Any]]:
+    """Cut the book into retrieval chunks along paragraph and chapter lines.
+
+    The old chunker slid a fixed window of words over the text and cut
+    wherever the count ran out, often mid-sentence, so a chunk could begin
+    with the second half of a thought and a quote could be split across two
+    sources. Chunks are now built from whole paragraphs (sentences, when a
+    paragraph is too long), never cross a chapter boundary, and the overlap
+    carried into the next chunk is a few whole sentences from the end of the
+    previous one rather than an arbitrary tail of words.
+    """
+    overlap = max(0, min(overlap, size // 3))
+    starts: dict[tuple[int, int], str] = {(page, index): title for page, index, title in (chapters or [])}
     chunks: list[dict[str, Any]] = []
-    start = 0
-    ordinal = 0
-    while start < len(items):
-        window = items[start : start + size]
-        if not window:
-            break
-        ordinal += 1
-        chunks.append(
-            {
-                "ordinal": ordinal,
-                "page_from": window[0][0],
-                "page_to": window[-1][0],
-                "content": " ".join(word for _, word in window),
-            }
-        )
-        if start + size >= len(items):
-            break
-        start += max(1, size - overlap)
+    # Each unit is (page_no, text, starts_paragraph).
+    current: list[tuple[int, str, bool]] = []
+    current_words = 0
+    fresh_words = 0  # words added after the carried-over overlap
+    chapter = ""
+
+    def flush(carry_overlap: bool) -> None:
+        nonlocal current, current_words, fresh_words
+        if not current or fresh_words == 0:
+            # Nothing but overlap: emitting it would store the same text twice.
+            current, current_words, fresh_words = [], 0, 0
+            return
+        parts: list[str] = []
+        for _, text, starts_paragraph in current:
+            if parts and starts_paragraph:
+                parts.append("\n\n" + text)
+            elif parts:
+                parts.append(" " + text)
+            else:
+                parts.append(text)
+        content = "".join(parts)
+        words = word_count(content)
+        previous = chunks[-1] if chunks else None
+        if previous and words < MIN_CHUNK_WORDS and previous["chapter"] == chapter and not carry_overlap:
+            # A stub at the end of a chapter joins the chunk before it.
+            previous["content"] += "\n\n" + content
+            previous["page_to"] = max(previous["page_to"], current[-1][0])
+        else:
+            chunks.append({
+                "ordinal": len(chunks) + 1,
+                "page_from": current[0][0],
+                "page_to": current[-1][0],
+                "chapter": chapter,
+                "content": content,
+            })
+        carried: list[tuple[int, str, bool]] = []
+        carried_words = 0
+        if carry_overlap:
+            for unit in reversed(current):
+                length = word_count(unit[1])
+                if carried_words + length > overlap:
+                    break
+                carried.insert(0, unit)
+                carried_words += length
+        current, current_words, fresh_words = carried, carried_words, 0
+
+    for page_no, text in pages:
+        for index, paragraph in enumerate(split_paragraphs(text)):
+            if (page_no, index) in starts:
+                flush(carry_overlap=False)
+                chapter = starts[(page_no, index)]
+            first = True
+            for unit in chunk_units(paragraph, size):
+                length = word_count(unit)
+                if current and current_words + length > size:
+                    flush(carry_overlap=True)
+                current.append((page_no, unit, first))
+                current_words += length
+                fresh_words += length
+                first = False
+    flush(carry_overlap=False)
+    if not chunks:
+        raise ClientError("В документе нет текста для индексации.")
     return chunks
 
 
@@ -2381,8 +2666,8 @@ def unpack_vector(blob: bytes) -> array:
     return values
 
 
-def rank_by_similarity(query: list[float], blobs: list[bytes], limit: int) -> list[tuple[int, float]]:
-    """Return (index, score) for the `limit` closest vectors, best first.
+def similarity_scores(query: list[float], blobs: list[bytes]) -> list[float]:
+    """Cosine similarity of the query to every vector, in input order.
 
     All vectors are unit length, so cosine similarity is a plain dot product.
     With NumPy this is a single matrix-vector product; without it, the array
@@ -2390,7 +2675,6 @@ def rank_by_similarity(query: list[float], blobs: list[bytes], limit: int) -> li
     """
     if not blobs:
         return []
-    limit = max(1, min(limit, len(blobs)))
     expected_bytes = len(query) * 4
     if any(len(blob) != expected_bytes for blob in blobs):
         raise ClientError("Индекс содержит фрагменты другой размерности. Переиндексируйте книги.")
@@ -2399,24 +2683,101 @@ def rank_by_similarity(query: list[float], blobs: list[bytes], limit: int) -> li
         query_vec = _np.asarray(query, dtype="<f4")
         if matrix.shape[1] != query_vec.shape[0]:
             raise ClientError("Размерность индекса не совпадает с моделью эмбеддингов. Переиндексируйте книги.")
-        scores = matrix @ query_vec
-        top = _np.argpartition(-scores, limit - 1)[:limit]
-        top = top[_np.argsort(-scores[top])]
-        return [(int(index), float(scores[index])) for index in top]
+        return [float(value) for value in (matrix @ query_vec)]
     query_array = array("f", query)
-    scored: list[tuple[int, float]] = []
-    for index, blob in enumerate(blobs):
+    scores: list[float] = []
+    for blob in blobs:
         values = unpack_vector(blob)
         if len(values) != len(query_array):
             raise ClientError("Размерность индекса не совпадает с моделью эмбеддингов. Переиндексируйте книги.")
-        scored.append((index, sum(a * b for a, b in zip(values, query_array))))
-    scored.sort(key=lambda item: item[1], reverse=True)
-    return scored[:limit]
+        scores.append(sum(a * b for a, b in zip(values, query_array)))
+    return scores
+
+
+def top_indexes(scores: list[float], limit: int) -> list[int]:
+    limit = max(1, min(limit, len(scores)))
+    return sorted(range(len(scores)), key=scores.__getitem__, reverse=True)[:limit]
+
+
+def rank_by_similarity(query: list[float], blobs: list[bytes], limit: int) -> list[tuple[int, float]]:
+    """Return (index, score) for the `limit` closest vectors, best first."""
+    scores = similarity_scores(query, blobs)
+    return [(index, scores[index]) for index in top_indexes(scores, limit)]
+
+
+FTS_TOKEN_RE = re.compile(r"\w+")
+
+
+def fts_query(text: str, max_terms: int = 24) -> str:
+    """Turn free text into a safe FTS5 query: quoted terms joined by OR.
+
+    Quoting every term neutralises the operators and punctuation of the
+    FTS5 query language, so a question with a dash, a colon or a bare AND
+    cannot break the statement. Words of six letters and more also match as
+    a prefix with their last two letters dropped — a crude stem that lets
+    "делегирование" find "делегировать" and "делегирования". BM25 ranks the
+    chunks that match more of the terms, and the rarer terms, higher.
+    """
+    terms: list[str] = []
+    seen: set[str] = set()
+    for token in FTS_TOKEN_RE.findall(text.lower()):
+        if len(token) < 2 or token in seen:
+            continue
+        seen.add(token)
+        terms.append(token)
+        if len(terms) >= max_terms:
+            break
+    parts: list[str] = []
+    for term in terms:
+        parts.append(f'"{term}"')
+        if len(term) >= 6:
+            parts.append(f'"{term[:-2]}"*')
+    return " OR ".join(parts)
+
+
+def fts_candidates(conn: Any, user_id: str, query: str, selected_ids: list[str], limit: int) -> list[str]:
+    """Chunk ids ranked by BM25 for the query, best first; empty when unavailable."""
+    if not text_search_enabled():
+        return []
+    match = fts_query(query)
+    if not match:
+        return []
+    sql = """SELECT chunks_fts.chunk_id AS chunk_id
+             FROM chunks_fts JOIN books ON books.id = chunks_fts.book_id
+             WHERE chunks_fts MATCH ? AND books.user_id = ?"""
+    params: list[Any] = [match, user_id]
+    if selected_ids:
+        sql += f" AND chunks_fts.book_id IN ({', '.join('?' for _ in selected_ids)})"
+        params.extend(selected_ids)
+    sql += " ORDER BY bm25(chunks_fts) LIMIT ?"
+    params.append(limit)
+    try:
+        rows = conn.execute(sql, tuple(params)).fetchall()
+    except sqlite3.OperationalError as error:
+        # A query the tokenizer rejects must not take the whole search down.
+        print(f"Text search skipped: {error}", file=sys.stderr)
+        return []
+    return [str(row["chunk_id"]) for row in rows]
+
+
+def rrf_fuse(rankings: list[list[str]], k: int = RRF_K) -> list[tuple[str, float]]:
+    """Reciprocal rank fusion: an item scores 1/(k+rank) in every list it appears in.
+
+    The two rankings score on incomparable scales (cosine in [-1, 1], BM25 as
+    a negative log), so only the positions are combined. An item near the top
+    of both lists wins; an item only one of them found still gets in, which
+    is the point: exact terms from BM25, paraphrase from the vectors.
+    """
+    fused: dict[str, float] = defaultdict(float)
+    for ranking in rankings:
+        for rank, item in enumerate(ranking, start=1):
+            fused[item] += 1.0 / (k + rank)
+    return sorted(fused.items(), key=lambda pair: pair[1], reverse=True)
 
 
 def index_book(book_id: str, path: Path) -> dict[str, int]:
-    pages = extract_pages(path)
-    chunks = make_chunks(pages)
+    pages, chapters = extract_document(path)
+    chunks = make_chunks(pages, chapters=chapters)
     vectors = embed_many([chunk["content"] for chunk in chunks])
     with db() as conn:
         # The reader needs the pages as they were, without the overlap that
@@ -2426,8 +2787,8 @@ def index_book(book_id: str, path: Path) -> dict[str, int]:
         conn.execute("DELETE FROM chunks WHERE book_id = ?", (book_id,))
         conn.executemany(
             """
-            INSERT INTO chunks (id, book_id, ordinal, page_from, page_to, content, embedding_json, embedding_vec, embedding_model, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?)
+            INSERT INTO chunks (id, book_id, ordinal, page_from, page_to, content, chapter, embedding_json, embedding_vec, embedding_model, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?)
             """,
             [
                 (
@@ -2437,6 +2798,7 @@ def index_book(book_id: str, path: Path) -> dict[str, int]:
                     chunk["page_from"],
                     chunk["page_to"],
                     chunk["content"],
+                    chunk.get("chapter", ""),
                     pack_vector(vector),
                     EMBEDDING_MODEL,
                     now_iso(),
@@ -4321,23 +4683,41 @@ def search(
         rows = conn.execute(sql, tuple(params)).fetchall()
         if not rows:
             raise empty_index_error(user_id, selected_ids)
-        ranked = rank_by_similarity(vector, [row["embedding_vec"] for row in rows], limit)
-        winner_ids = [rows[index]["id"] for index, _ in ranked]
-        scores = {rows[index]["id"]: score for index, score in ranked}
+        position = {str(row["id"]): index for index, row in enumerate(rows)}
+        cosine = similarity_scores(vector, [row["embedding_vec"] for row in rows])
+        # Both rankings go deeper than the final cut so that a chunk ranked
+        # 12th by vectors and 3rd by text can still end up in the top six.
+        pool = max(limit * 4, 30)
+        vector_ranking = [str(rows[index]["id"]) for index in top_indexes(cosine, pool)]
+        # Text hits are restricted to chunks the vector scan saw: a book indexed
+        # with another embedding model is not searchable until reindexed.
+        text_ranking = [chunk_id for chunk_id in fts_candidates(conn, user_id, query, selected_ids, pool)
+                        if chunk_id in position]
+        if text_ranking:
+            fused = rrf_fuse([vector_ranking, text_ranking])
+        else:
+            fused = [(chunk_id, 1.0 / (RRF_K + rank)) for rank, chunk_id in enumerate(vector_ranking, start=1)]
+        winner_ids = [chunk_id for chunk_id, _ in fused[:limit]]
+        rank_scores = dict(fused)
         detail_rows = conn.execute(
             f"""SELECT chunks.id, chunks.book_id, chunks.ordinal, chunks.page_from, chunks.page_to,
-                       chunks.content, books.title
+                       chunks.content, chunks.chapter, books.title
                 FROM chunks JOIN books ON books.id = chunks.book_id
                 WHERE books.user_id = ? AND chunks.id IN ({', '.join('?' for _ in winner_ids)})""",
             (user_id, *winner_ids),
         ).fetchall()
     by_id = {row["id"]: dict(row) for row in detail_rows}
+    text_hits = set(text_ranking)
     results: list[dict[str, Any]] = []
     for chunk_id in winner_ids:
         item = by_id.get(chunk_id)
         if item is None:  # pragma: no cover - chunk deleted between queries
             continue
-        item["score"] = round(scores[chunk_id], 5)
+        # `score` stays the cosine similarity the interface has always shown;
+        # `rank_score` is the fused value the list is ordered by.
+        item["score"] = round(cosine[position[chunk_id]], 5)
+        item["rank_score"] = round(rank_scores[chunk_id], 6)
+        item["matched_text"] = chunk_id in text_hits
         results.append(item)
     return results
 
@@ -4346,7 +4726,8 @@ def overview_sources(user_id: str, book_id: str, limit: int = 8) -> list[dict[st
     """Select source fragments across a book for a grounded whole-book analysis."""
     with db() as conn:
         rows = conn.execute(
-            """SELECT chunks.id, chunks.book_id, chunks.ordinal, chunks.page_from, chunks.page_to, chunks.content, books.title
+            """SELECT chunks.id, chunks.book_id, chunks.ordinal, chunks.page_from, chunks.page_to,
+                      chunks.content, chunks.chapter, books.title
                FROM chunks JOIN books ON books.id = chunks.book_id
                WHERE chunks.book_id = ? AND books.user_id = ? AND books.status = 'ready'
                ORDER BY chunks.ordinal""",
@@ -4568,7 +4949,9 @@ def answer_question(
     saved_context = memory_context(user_id)
     director = profile_display_name(user_id, profile)
     context = "\n\n".join(
-        f"[S{i}] Книга: {source['title']}; страницы {source['page_from']}–{source['page_to']}\n{source['content']}"
+        f"[S{i}] Книга: {source['title']}; "
+        + (f"глава: {source['chapter']}; " if source.get("chapter") else "")
+        + f"страницы {source['page_from']}–{source['page_to']}\n{source['content']}"
         for i, source in enumerate(sources, start=1)
     )
     # Empty fields are stated as empty. Telling the model "CliftonStrengths: "
@@ -4832,7 +5215,7 @@ class AppHandler(SimpleHTTPRequestHandler):
             if AUTH_REQUIRED and not session_is_valid(self.headers.get("Cookie", "")):
                 self.json_response(HTTPStatus.OK, {"ok": True})
                 return
-            self.json_response(HTTPStatus.OK, {"ok": True, "api_key_configured": bool(OPENAI_API_KEY), "provider": "openai", "embedding_model": EMBEDDING_MODEL, "claude_configured": bool(ANTHROPIC_API_KEY), "claude_model": CLAUDE_MODEL, "vector_backend": "numpy" if _np is not None else "python"})
+            self.json_response(HTTPStatus.OK, {"ok": True, "api_key_configured": bool(OPENAI_API_KEY), "provider": "openai", "embedding_model": EMBEDDING_MODEL, "claude_configured": bool(ANTHROPIC_API_KEY), "claude_model": CLAUDE_MODEL, "vector_backend": "numpy" if _np is not None else "python", "text_search": text_search_enabled()})
             return
         if parsed.path == "/api/auth/status":
             user = session_user(self.headers.get("Cookie", ""))

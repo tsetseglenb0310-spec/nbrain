@@ -23,15 +23,20 @@ wanted something that shows me the page it is quoting and makes me come back.
 
 ## What it does
 
-- **Upload & index** — PDF/EPUB/TXT → text extraction → 450-word chunks with
-  overlap → OpenAI embeddings → normalized float32 vectors in SQLite.
+- **Upload & index** — PDF/EPUB/TXT → text extraction → chunks of up to 450 words cut
+  along paragraph and sentence boundaries, never across a chapter (EPUB spine
+  documents, the PDF outline, or "Глава N" / "Chapter N" headings in plain text),
+  with a sentence-aligned overlap → OpenAI embeddings → normalized float32 vectors in SQLite.
   Indexing runs in a background worker pool; the UI polls status, you can close the tab.
   The queue is recorded in the database, so a restart or redeploy resumes unfinished
   books instead of failing them, and rate limits or outages at the provider are
   retried with exponential backoff before a book is ever marked as failed.
-- **Semantic search & grounded answers** — cosine search over the whole library
-  (one numpy matrix product, pure-Python fallback), then an OpenAI or Claude
-  answer built strictly from the six best fragments, each shown as a clickable source.
+- **Hybrid search & grounded answers** — cosine search over the whole library
+  (one numpy matrix product, pure-Python fallback) fused by reciprocal rank with
+  BM25 over an SQLite FTS5 index of the same chunks, so exact terms, names and
+  numbers are found as reliably as paraphrase. Then an OpenAI or Claude answer
+  built strictly from the six best fragments, each shown as a clickable source
+  with its chapter and pages.
 - **Reader** — books are stored a second time as plain pages for reading;
   position, bookmarks and notes are kept server-side so you can continue from your phone.
 - **Study plan** — the book is split into lessons by *text volume*, not page count,
@@ -115,8 +120,8 @@ Full table with descriptions: [docs/README.ru.md](docs/README.ru.md#api).
 ## Limitations & roadmap
 
 - PDFs need a text layer — no OCR yet.
-- Search is a full library scan; fine up to tens of thousands of chunks, then a vector index (pgvector / sqlite-vec) is needed.
-- Next: PostgreSQL + pgvector, indexing queue as a separate worker, OCR, hybrid search + reranking, team roles.
+- Vector search is a full library scan; fine up to tens of thousands of chunks, then a vector index (pgvector / sqlite-vec) is needed.
+- Next: PostgreSQL + pgvector, indexing queue as a separate worker, OCR, reranking, team roles.
 
 ## About
 
