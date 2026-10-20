@@ -168,6 +168,25 @@ check("свой же логин принимается повторно", server
 check("некорректный логин при смене отклоняется", raises(server.set_username, AID, "Анна"))
 check("смена логина несуществующего аккаунта -> ClientError", raises(server.set_username, "нет-такого", "whoever"))
 server.set_username(AID, "anna")
+
+check("без NBRAIN_ADMIN_RESET сброс ничего не делает", server.apply_admin_reset() is False)
+owner_token = server.make_session_token(server.get_user(UID))
+server.ADMIN_RESET, server.ADMIN_USERNAME, server.ADMIN_PASSWORD = True, "Recovered.Admin", "Восстановленный-2026"
+check("сброс из окружения применяется к первому администратору", server.apply_admin_reset() is True)
+recovered = server.get_user(UID)
+check("логин администратора взят из NBRAIN_ADMIN_USERNAME", recovered["username"] == "recovered.admin", f"({recovered['username']})")
+check("пароль администратора взят из NBRAIN_ADMIN_PASSWORD",
+      server.verify_password("Восстановленный-2026", recovered["password_hash"], recovered["password_salt"]))
+check("прежняя сессия администратора закрыта", not server.session_is_valid(f"nbrain_session={owner_token}"))
+check("аккаунт Анны сброс не задел", server.get_user(AID)["username"] == "anna")
+server.ADMIN_PASSWORD = "short"
+check("некорректный пароль в окружении не роняет запуск", server.apply_admin_reset() is False)
+check("и не меняет логин", server.get_user(UID)["username"] == "recovered.admin")
+server.ADMIN_USERNAME, server.ADMIN_PASSWORD = "muhamed", "МойСложныйПароль-2026"
+server.apply_admin_reset()
+server.ADMIN_RESET = False
+check("повторный сброс возвращает прежний логин", server.get_user(UID)["username"] == "muhamed")
+token = server.make_session_token(server.get_user(UID))
 check("удалить аккаунт, под которым вошли, нельзя", raises(server.delete_user, UID, UID))
 check("удалить последнего администратора нельзя",
       raises(server.delete_user, UID, AID))

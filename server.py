@@ -138,6 +138,10 @@ ADMIN_USERNAME = os.environ.get("NBRAIN_ADMIN_USERNAME", "admin")
 # in the interface does not. This one is only used when the account is created;
 # afterwards the owner changes it in the profile.
 ADMIN_DISPLAY_NAME = os.environ.get("NBRAIN_ADMIN_DISPLAY_NAME", "").strip()[:120]
+# Recovery for hosts without a shell (Render's free tier has none): with this
+# flag set, every start applies NBRAIN_ADMIN_USERNAME and NBRAIN_ADMIN_PASSWORD
+# to the primary administrator account. Remove the flag once signed in.
+ADMIN_RESET = env_flag("NBRAIN_ADMIN_RESET", False)
 SESSION_SECRET = os.environ.get("NBRAIN_SESSION_SECRET", "")
 PASSWORD_ITERATIONS = int(os.environ.get("NBRAIN_PASSWORD_ITERATIONS", "200000"))
 MIN_PASSWORD_LENGTH = 8
@@ -864,6 +868,40 @@ def init_storage() -> None:
         conn.execute("PRAGMA journal_mode = WAL")
     migrate_embeddings_to_blob()
     ensure_fts_index()
+    apply_admin_reset()
+
+
+def apply_admin_reset() -> bool:
+    """Reset the primary administrator's login and password from the environment.
+
+    The variables normally matter only once, when the first account is created
+    on an empty database. Someone locked out of a hosted instance with no shell
+    access can set NBRAIN_ADMIN_RESET=1 next to them, redeploy, sign in, and
+    remove the flag. While the flag stays, every restart reapplies the values
+    and closes the account's sessions, which the log says plainly.
+    """
+    if not ADMIN_RESET:
+        return False
+    user = primary_user()
+    if not user:
+        return False
+    changed: list[str] = []
+    try:
+        if ADMIN_USERNAME and normalize_username(ADMIN_USERNAME) != user["username"]:
+            set_username(user["id"], ADMIN_USERNAME)
+            changed.append("login")
+        if ADMIN_PASSWORD:
+            set_user_password(user["id"], ADMIN_PASSWORD)
+            changed.append("password")
+    except ClientError as error:
+        print(f"NBRAIN_ADMIN_RESET failed: {error}", file=sys.stderr)
+        return False
+    username = normalize_username(ADMIN_USERNAME) or user["username"]
+    print(
+        f"NBRAIN_ADMIN_RESET: primary account «{username}», {' and '.join(changed) or 'nothing'} set from "
+        "the environment. Remove NBRAIN_ADMIN_RESET after signing in, or every restart will repeat this."
+    )
+    return bool(changed)
 
 
 _fts5_support: bool | None = None
