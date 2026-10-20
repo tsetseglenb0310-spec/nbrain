@@ -680,7 +680,7 @@ $('#onboarding-skip').addEventListener('click', async () => {
   await loadWorkspace({ firstRun: true });
 });
 
-const bookStatusLabels = { ready: 'Готово', indexing: 'Индексируется', failed: 'Ошибка' };
+const bookStatusLabels = { ready: 'Готово', queued: 'В очереди', indexing: 'Индексируется', failed: 'Ошибка' };
 
 function renderBooks(books) {
   // Re-rendering during polling must not silently drop the user's selection.

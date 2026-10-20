@@ -8,7 +8,13 @@
 import http.client, os, shutil, sys, tempfile, threading, time
 from pathlib import Path
 
-TARGET = sys.argv[1] if len(sys.argv) > 1 else str(Path(__file__).resolve().parent.parent)
+for stream in (sys.stdout, sys.stderr):
+    if hasattr(stream, "reconfigure"):
+        stream.reconfigure(encoding="utf-8", errors="replace")
+
+# Первый аргумент — каталог проекта. Под `unittest discover` в argv[1] лежит
+# слово «discover», поэтому аргумент принимается только если это каталог.
+TARGET = sys.argv[1] if len(sys.argv) > 1 and os.path.isdir(sys.argv[1]) else str(Path(__file__).resolve().parent.parent)
 WORK = Path(tempfile.mkdtemp(prefix="nbtrav-"))
 
 # Копируем ровно то, что нужно серверу и пробам: код, статику и requirements.

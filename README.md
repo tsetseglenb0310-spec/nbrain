@@ -1,6 +1,7 @@
 # NBrain — turn any book into a personal study course
 
 [![Live](https://img.shields.io/badge/live-app.nbrain--ts.org-2ea44f)](https://app.nbrain-ts.org)
+[![Tests](https://github.com/tsetseglenb0310-spec/nbrain/actions/workflows/tests.yml/badge.svg)](https://github.com/tsetseglenb0310-spec/nbrain/actions/workflows/tests.yml)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![Dependencies](https://img.shields.io/badge/runtime%20deps-3-lightgrey)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -25,6 +26,9 @@ wanted something that shows me the page it is quoting and makes me come back.
 - **Upload & index** — PDF/EPUB/TXT → text extraction → 450-word chunks with
   overlap → OpenAI embeddings → normalized float32 vectors in SQLite.
   Indexing runs in a background worker pool; the UI polls status, you can close the tab.
+  The queue is recorded in the database, so a restart or redeploy resumes unfinished
+  books instead of failing them, and rate limits or outages at the provider are
+  retried with exponential backoff before a book is ever marked as failed.
 - **Semantic search & grounded answers** — cosine search over the whole library
   (one numpy matrix product, pure-Python fallback), then an OpenAI or Claude
   answer built strictly from the six best fragments, each shown as a clickable source.
@@ -33,7 +37,8 @@ wanted something that shows me the page it is quoting and makes me come back.
 - **Study plan** — the book is split into lessons by *text volume*, not page count,
   and scheduled from your minutes-per-day and target date.
 - **Lessons** — summary, key ideas, terms, quotes, a practical task, five quiz
-  questions and six flashcards, all generated from the pages of that lesson only.
+  questions and six flashcards, all generated from the pages of that lesson only,
+  requested as strict JSON Schema output so a malformed reply cannot reach the database.
   Any citation outside the lesson range is discarded: a wrong page number is worse than none.
 - **Spaced repetition** — SM-2 scheduling (1 day, 6 days, then by ease factor);
   a quiz score under 70 % sends the lesson's cards back into rotation.
@@ -88,7 +93,8 @@ users register themselves (or set `NBRAIN_REGISTRATION_OPEN=0`).
 Docker: `docker compose up -d --build`. Deployment notes for Render are in
 [RENDER_DEPLOY.md](RENDER_DEPLOY.md); the full list of environment variables is in [.env.example](.env.example).
 
-Tests: `python -m unittest discover tests` (HTTP API, RAG pipeline, path-traversal protection).
+Tests: `python tests/run_all.py` (RAG pipeline, HTTP API, path-traversal protection; no network,
+no API key needed). The same command runs in GitHub Actions on Python 3.11–3.13.
 
 ## API
 

@@ -30,7 +30,7 @@ from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
-from email.utils import formatdate, make_msgid
+from email.utils import formatdate, make_msgid, parsedate_to_datetime
 from html import escape as html_escape, unescape
 from http import HTTPStatus
 from http.cookies import SimpleCookie
@@ -168,6 +168,13 @@ MAX_ARCHIVE_ENTRIES = 5000
 # starting dozens of parallel OpenAI conversations at once.
 INDEXING_WORKERS = max(1, int(os.environ.get("NBRAIN_INDEX_WORKERS", "2")))
 MAX_INDEXING_QUEUE = max(1, int(os.environ.get("NBRAIN_INDEX_QUEUE", "64")))
+# Model providers answer 429 and 5xx routinely; a 500-page book is hundreds of
+# embedding calls, and one such reply used to fail the whole book. Transient
+# failures are retried with a growing pause before the caller hears about them.
+API_RETRIES = max(0, int(os.environ.get("NBRAIN_API_RETRIES", "4")))
+API_RETRY_BASE_SECONDS = max(0.0, float(os.environ.get("NBRAIN_API_RETRY_BASE", "1.5")))
+API_RETRY_MAX_SECONDS = 60.0
+RETRYABLE_HTTP_STATUSES = {408, 409, 429, 500, 502, 503, 504}
 # Brute-force protection for the single-password login.
 LOGIN_FREE_ATTEMPTS = 3
 LOGIN_MAX_DELAY_SECONDS = 60.0
@@ -570,6 +577,82 @@ def upstream_error(name: str, error: Exception) -> ClientError:
     reason = getattr(error, "reason", error)
     print(f"{name} API unreachable: {reason}", file=sys.stderr)
     return ClientError(f"Не удалось связаться с {name}. Проверьте доступ в интернет и повторите.")
+
+
+# Tests replace this with a stub so a retry test does not actually wait.
+_retry_sleep = time.sleep
+
+
+def retry_after_seconds(error: Exception) -> float | None:
+    """Honour a Retry-After header when the provider sends one."""
+    headers = getattr(error, "headers", None)
+    raw = headers.get("Retry-After") if headers is not None else None
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(raw)
+        return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def retry_delay(attempt: int, error: Exception) -> float:
+    """Pause before retry number `attempt` (counting from 1).
+
+    Exponential growth with a little jitter, so that two workers that failed
+    together do not retry together; a Retry-After from the provider wins when
+    it asks for longer. Capped so a stubborn outage fails in minutes, not hours.
+    """
+    base = API_RETRY_BASE_SECONDS * (2 ** (attempt - 1))
+    delay = base + secrets.randbelow(1000) / 1000.0 * min(1.0, base)
+    advised = retry_after_seconds(error)
+    if advised is not None:
+        delay = max(delay, advised)
+    return min(delay, API_RETRY_MAX_SECONDS)
+
+
+def is_retryable(error: Exception) -> bool:
+    if isinstance(error, HTTPError):
+        return error.code in RETRYABLE_HTTP_STATUSES
+    # Connection resets, DNS hiccups and read timeouts are all worth one more try.
+    return isinstance(error, (URLError, TimeoutError, ConnectionError))
+
+
+def call_with_retries(name: str, send: Any) -> dict[str, Any]:
+    """Run `send()` and retry it on transient provider failures.
+
+    `send` performs one HTTP request and returns the parsed JSON body. Rate
+    limits (429), server-side errors (5xx) and network failures are retried
+    up to API_RETRIES times; anything else (a bad key, an unknown model, a
+    malformed request) is reported at once, because repeating it cannot help.
+    """
+    attempt = 0
+    while True:
+        try:
+            return send()
+        except Exception as error:  # noqa: BLE001 - classified right below
+            attempt += 1
+            if not is_retryable(error) or attempt > API_RETRIES:
+                if isinstance(error, (HTTPError, URLError, TimeoutError, ConnectionError)):
+                    raise upstream_error(name, error) from error
+                raise
+            if isinstance(error, HTTPError):
+                # The body is consumed here so the retry log is informative; the
+                # final failure, if it comes, is a fresh error with its own body.
+                try:
+                    detail = error.read().decode("utf-8", errors="replace")[:300]
+                except Exception:  # pragma: no cover - body already consumed
+                    detail = ""
+                what = f"HTTP {error.code} {detail}".strip()
+            else:
+                what = f"{getattr(error, 'reason', error)}"
+            delay = retry_delay(attempt, error)
+            print(f"{name} request failed ({what}); retry {attempt}/{API_RETRIES} in {delay:.1f}s", file=sys.stderr)
+            _retry_sleep(delay)
 
 
 def session_cookie(token: str | None = None) -> str:
@@ -1929,7 +2012,7 @@ def purge_user(user_id: str) -> dict[str, Any]:
             raise ClientError("Пользователь не найден.")
         active = indexing_in_progress()
         busy = conn.execute(
-            "SELECT id FROM books WHERE user_id = ? AND status = 'indexing'", (user_id,)
+            "SELECT id FROM books WHERE user_id = ? AND status IN ('queued', 'indexing')", (user_id,)
         ).fetchall()
         if any(item["id"] in active for item in busy):
             raise ClientError("Дождитесь окончания индексации книг этого аккаунта.")
@@ -2211,52 +2294,45 @@ def make_chunks(pages: list[tuple[int, str]], size: int = CHUNK_WORDS, overlap: 
 def openai_request(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     if not OPENAI_API_KEY:
         raise ClientError("Добавьте OPENAI_API_KEY в переменные окружения, чтобы включить поиск и ответы OpenAI.")
-    request = Request(
-        f"https://api.openai.com/v1/{path}",
-        data=json.dumps(payload).encode("utf-8"),
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json",
-        },
-    )
-    try:
+    body = json.dumps(payload).encode("utf-8")
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    def send() -> dict[str, Any]:
+        # A fresh Request per attempt: urllib does not rewind a consumed body.
+        request = Request(f"https://api.openai.com/v1/{path}", data=body, method="POST", headers=headers)
         with urlopen(request, timeout=120) as response:
             return json.loads(response.read().decode("utf-8"))
-    except HTTPError as error:
-        raise upstream_error("OpenAI", error) from error
-    except URLError as error:
-        raise upstream_error("OpenAI", error) from error
+
+    return call_with_retries("OpenAI", send)
 
 
 def claude_request(instructions: str, prompt: str, max_tokens: int) -> str:
     """Ask Claude through Anthropic's Messages API for a grounded final answer."""
     if not ANTHROPIC_API_KEY:
         raise ClientError("Claude пока не подключён. Добавьте ANTHROPIC_API_KEY в переменные окружения Render.")
-    request = Request(
-        "https://api.anthropic.com/v1/messages",
-        data=json.dumps(
-            {
-                "model": CLAUDE_MODEL,
-                "max_tokens": max_tokens,
-                "system": instructions,
-                "messages": [{"role": "user", "content": prompt}],
-            }
-        ).encode("utf-8"),
-        method="POST",
-        headers={
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "Content-Type": "application/json",
-        },
-    )
-    try:
+    body = json.dumps(
+        {
+            "model": CLAUDE_MODEL,
+            "max_tokens": max_tokens,
+            "system": instructions,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+    ).encode("utf-8")
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+    }
+
+    def send() -> dict[str, Any]:
+        request = Request("https://api.anthropic.com/v1/messages", data=body, method="POST", headers=headers)
         with urlopen(request, timeout=180) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except HTTPError as error:
-        raise upstream_error("Claude", error) from error
-    except URLError as error:
-        raise upstream_error("Claude", error) from error
+            return json.loads(response.read().decode("utf-8"))
+
+    payload = call_with_retries("Claude", send)
 
     answer = "".join(
         str(item.get("text", ""))
@@ -2411,6 +2487,10 @@ def _indexing_worker() -> None:
             _indexing_queued.discard(book_id)
             _indexing_now.add(book_id)
         try:
+            # The row moves from "queued" to "indexing" only now, so that a
+            # restart can tell a book that was waiting from one cut off mid-work.
+            with db() as conn:
+                conn.execute("UPDATE books SET status = 'indexing', error = NULL WHERE id = ?", (book_id,))
             _index_one(book_id, path)
         finally:
             with _indexing_lock:
@@ -2451,17 +2531,45 @@ def start_indexing(book_id: str, path: Path) -> bool:
     return True
 
 
-def resume_interrupted_indexing() -> None:
-    """Mark books left mid-indexing by a restart, so they can be retried."""
+def resume_interrupted_indexing() -> int:
+    """Put books that a restart caught waiting or mid-indexing back in the queue.
+
+    The queue itself lives in memory, but the book row records whether the
+    work was finished: anything still "queued" or "indexing" when the process
+    comes up was not. Those books used to be marked failed and left for the
+    person to notice and reindex by hand; now they simply continue, oldest
+    first. A book whose file is gone cannot continue and is marked as such.
+    Returns the number of books put back in the queue.
+    """
     with db() as conn:
-        stuck = conn.execute("SELECT id FROM books WHERE status = 'indexing'").fetchall()
-        if stuck:
-            conn.execute(
-                "UPDATE books SET status = 'failed', error = ? WHERE status = 'indexing'",
-                ("Индексация прервана перезапуском сервиса. Запустите переиндексацию.",),
-            )
-    if stuck:
-        print(f"Marked {len(stuck)} interrupted book(s) as failed; reindex them from the library.")
+        pending = conn.execute(
+            """SELECT id, stored_path FROM books
+               WHERE status IN ('queued', 'indexing') ORDER BY created_at"""
+        ).fetchall()
+    resumed = 0
+    for row in pending:
+        path = Path(row["stored_path"])
+        if not path.exists():
+            with db() as conn:
+                conn.execute(
+                    "UPDATE books SET status = 'failed', error = ? WHERE id = ?",
+                    ("Файл книги не найден на диске после перезапуска. Загрузите книгу заново.", row["id"]),
+                )
+            continue
+        try:
+            with db() as conn:
+                conn.execute("UPDATE books SET status = 'queued', error = NULL WHERE id = ?", (row["id"],))
+            if start_indexing(row["id"], path):
+                resumed += 1
+        except ClientError as error:
+            with db() as conn:
+                conn.execute(
+                    "UPDATE books SET status = 'failed', error = ? WHERE id = ?",
+                    (f"{error} Запустите переиндексацию позже.", row["id"]),
+                )
+    if pending:
+        print(f"Resumed indexing of {resumed} of {len(pending)} book(s) left unfinished by the last run.")
+    return resumed
 
 
 def list_books(user_id: str) -> list[dict[str, Any]]:
@@ -2475,7 +2583,7 @@ def list_books(user_id: str) -> list[dict[str, Any]]:
     books = []
     for row in rows:
         book = dict(row)
-        book["indexing"] = book["id"] in active or book["status"] == "indexing"
+        book["indexing"] = book["id"] in active or book["status"] in ("queued", "indexing")
         books.append(book)
     return books
 
@@ -2491,8 +2599,10 @@ def reindex_book(user_id: str, book_id: str) -> dict[str, Any]:
     path = Path(row["stored_path"])
     if not path.exists():
         raise ClientError("Исходный файл книги не найден на диске. Загрузите книгу заново.")
+    if book_id in indexing_in_progress():
+        raise ClientError("Эта книга уже индексируется.")
     with db() as conn:
-        conn.execute("UPDATE books SET status = 'indexing', error = NULL WHERE id = ?", (book_id,))
+        conn.execute("UPDATE books SET status = 'queued', error = NULL WHERE id = ?", (book_id,))
     try:
         queued = start_indexing(book_id, path)
     except ClientError:
@@ -2504,7 +2614,7 @@ def reindex_book(user_id: str, book_id: str) -> dict[str, Any]:
         raise
     if not queued:
         raise ClientError("Эта книга уже индексируется.")
-    return {"id": book_id, "status": "indexing"}
+    return {"id": book_id, "status": "queued"}
 
 
 def delete_book(user_id: str, book_id: str) -> dict[str, Any]:
@@ -3490,20 +3600,87 @@ def lesson_source_text(book_id: str, page_from: int, page_to: int) -> tuple[str,
     return text[:LESSON_SOURCE_CHAR_LIMIT], len(text)
 
 
-def llm_json(instructions: str, prompt: str, max_tokens: int = 2600) -> dict[str, Any]:
+def strict_object(properties: dict[str, Any]) -> dict[str, Any]:
+    """An object schema in the shape OpenAI's strict mode demands.
+
+    Strict mode guarantees the reply matches the schema, but only accepts a
+    schema where every property is required and nothing extra is allowed;
+    optional values are expressed as nullable instead.
+    """
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": list(properties),
+        "additionalProperties": False,
+    }
+
+
+PAGE_OR_NULL = {"type": ["integer", "null"], "description": "Номер страницы из маркера [стр. N] или null."}
+
+LESSON_SCHEMA = strict_object({
+    "title": {"type": "string"},
+    "goal": {"type": "string"},
+    "summary": {"type": "string"},
+    "key_ideas": {"type": "array", "items": strict_object({
+        "idea": {"type": "string"}, "why": {"type": "string"}, "page": PAGE_OR_NULL,
+    })},
+    "terms": {"type": "array", "items": strict_object({
+        "term": {"type": "string"}, "meaning": {"type": "string"}, "page": PAGE_OR_NULL,
+    })},
+    "quotes": {"type": "array", "items": strict_object({
+        "text": {"type": "string"}, "page": PAGE_OR_NULL,
+    })},
+    "practice": {"type": "string"},
+    "questions": {"type": "array", "items": strict_object({
+        "prompt": {"type": "string"},
+        "options": {"type": "array", "items": {"type": "string"}},
+        "answer": {"type": "integer"},
+        "explanation": {"type": "string"},
+        "page": PAGE_OR_NULL,
+    })},
+    "flashcards": {"type": "array", "items": strict_object({
+        "front": {"type": "string"}, "back": {"type": "string"}, "page": PAGE_OR_NULL,
+    })},
+})
+
+
+def llm_json(
+    instructions: str,
+    prompt: str,
+    max_tokens: int = 2600,
+    schema: dict[str, Any] | None = None,
+    schema_name: str = "nbrain_result",
+) -> dict[str, Any]:
     """Ask the model for JSON and return it, or fail with a message we own.
 
-    Models occasionally wrap JSON in prose or a code fence. Rather than let a
-    stray backtick turn into a 500, the first balanced object in the reply is
-    extracted; only if that also fails does the caller hear about it.
+    With a schema the request uses Structured Outputs: the provider itself
+    constrains generation to the schema, so a missing field or a stray code
+    fence cannot happen. The lenient parsing below is kept for the day the
+    configured model does not support strict mode, or returns the JSON as a
+    refusal-free but unconstrained text: the first balanced object in the
+    reply is extracted, and only if that fails does the caller hear about it.
     """
-    payload = {
+    payload: dict[str, Any] = {
         "model": ANSWER_MODEL,
         "instructions": instructions,
         "input": prompt,
         "max_output_tokens": max_tokens,
     }
-    raw = response_text(openai_request("responses", payload)).strip()
+    if schema is not None:
+        payload["text"] = {
+            "format": {"type": "json_schema", "name": schema_name, "schema": schema, "strict": True}
+        }
+    response = openai_request("responses", payload)
+    refusal = response_refusal(response)
+    if refusal:
+        print(f"Model refused the request: {refusal[:300]}", file=sys.stderr)
+        raise ClientError("Модель отказалась составлять материал по этому тексту. Попробуйте другой диапазон страниц.")
+    if response.get("status") == "incomplete":
+        # Typically max_output_tokens: the JSON is cut off and cannot be used.
+        reason = (response.get("incomplete_details") or {}).get("reason", "unknown")
+        print(f"Model reply incomplete: {reason}", file=sys.stderr)
+        raise ClientError("Ответ модели оборвался. Попробуйте сформировать занятие ещё раз.")
+    raw = response_text(response).strip()
     if not raw:
         raise ClientError("Модель вернула пустой ответ. Попробуйте ещё раз.")
     try:
@@ -3648,7 +3825,9 @@ def generate_lesson(user_id: str, lesson_id: str, force: bool = False) -> dict[s
         f"Цель обучения: {lesson.get('plan_goal') or director.get('goals') or 'не указана'}.\n\n"
         f"Текст страниц:\n{source}"
     )
-    data = clean_lesson_payload(llm_json(LESSON_INSTRUCTIONS, prompt), lesson)
+    data = clean_lesson_payload(
+        llm_json(LESSON_INSTRUCTIONS, prompt, schema=LESSON_SCHEMA, schema_name="nbrain_lesson"), lesson
+    )
     stamp = now_iso()
     with db() as conn:
         conn.execute(
@@ -4086,7 +4265,7 @@ def empty_index_error(user_id: str, selected_ids: list[str]) -> ClientError:
             statuses = {row["status"]: row["total"] for row in rows}
             if not statuses:
                 return ClientError("Выбранные книги не найдены. Обновите список библиотеки.")
-            if statuses.get("indexing"):
+            if statuses.get("indexing") or statuses.get("queued"):
                 return ClientError("Выбранные книги ещё индексируются. Подождите завершения и повторите запрос.")
             if statuses.get("failed"):
                 return ClientError("Выбранные книги не проиндексированы из-за ошибки. Откройте библиотеку и запустите переиндексацию.")
@@ -4227,6 +4406,15 @@ def response_text(payload: dict[str, Any]) -> str:
             if content.get("type") == "output_text":
                 return content.get("text", "")
     return payload.get("output_text", "")
+
+
+def response_refusal(payload: dict[str, Any]) -> str:
+    """The refusal text of a Responses API reply, or an empty string."""
+    for output in payload.get("output", []):
+        for content in output.get("content", []):
+            if content.get("type") == "refusal":
+                return str(content.get("refusal") or "отказ без объяснения")
+    return ""
 
 
 def plan_sections(answer: str) -> list[tuple[str | None, list[str]]]:
@@ -5037,13 +5225,13 @@ class AppHandler(SimpleHTTPRequestHandler):
         with db() as conn:
             conn.execute(
                 """INSERT INTO books (id, user_id, filename, title, extension, stored_path, status, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, 'indexing', ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)""",
                 (book_id, self.user_id, filename, display_title(filename), extension, str(stored_path), now_iso()),
             )
         try:
             start_indexing(book_id, stored_path)
         except ClientError:
-            # The row already says "indexing"; leaving it there would strand the
+            # The row already says "queued"; leaving it there would strand the
             # book forever, so record the refusal and let the user retry.
             with db() as conn:
                 conn.execute(
@@ -5053,7 +5241,7 @@ class AppHandler(SimpleHTTPRequestHandler):
             raise
         self.json_response(
             HTTPStatus.ACCEPTED,
-            {"book_id": book_id, "status": "indexing", "title": display_title(filename)},
+            {"book_id": book_id, "status": "queued", "title": display_title(filename)},
         )
 
 

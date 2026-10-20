@@ -2,6 +2,10 @@
 import hashlib, http.client, json, os, random, sqlite3, sys, tempfile, threading, time
 from pathlib import Path
 
+for stream in (sys.stdout, sys.stderr):
+    if hasattr(stream, "reconfigure"):
+        stream.reconfigure(encoding="utf-8", errors="replace")
+
 WORK = Path(tempfile.mkdtemp(prefix="nbhttp-"))
 WORK.mkdir(exist_ok=True)
 DIM = 64
@@ -182,6 +186,7 @@ status, payload, _ = call("POST", "/api/books", raw=content, cookie=session,
                           headers={"X-Filename": "delegation.txt"})
 elapsed = time.time() - start
 check("загрузка отвечает 202 Accepted", status == 202, f"({status} {payload})")
+check("книга принята в очередь", payload.get("status") == "queued", f"({payload})")
 check("ответ приходит мгновенно, не дожидаясь индексации", elapsed < 2.0, f"({elapsed:.2f}s)")
 book_id = payload.get("book_id")
 check("сервер вернул id книги", bool(book_id))

@@ -1,5 +1,13 @@
-import hashlib, json, os, random, sys, tempfile, time, zipfile
+import hashlib, io, json, os, random, sys, tempfile, time, zipfile
+from email.message import Message
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+
+# Названия проверок — на русском; консоль Windows по умолчанию в cp1252 и
+# роняла тест на первом же print. Вывод переводится в UTF-8 независимо от среды.
+for stream in (sys.stdout, sys.stderr):
+    if hasattr(stream, "reconfigure"):
+        stream.reconfigure(encoding="utf-8", errors="replace")
 
 WORK = Path(tempfile.mkdtemp(prefix="nbdata-"))
 os.environ.update({
@@ -19,6 +27,7 @@ DIM = 64
 def fake_generate(payload):
     """Заглушка генерации занятия: возвращает разбираемый JSON нужной формы."""
     fake_generate.calls += 1
+    fake_generate.last_payload = payload
     data = {
         "title": "Ясность в управлении",
         "goal": "Понимать, зачем команде ясные ожидания",
@@ -38,6 +47,7 @@ def fake_generate(payload):
 
 
 fake_generate.calls = 0
+fake_generate.last_payload = None
 AID_ABSENT = "нет-такого-аккаунта"
 
 
@@ -54,6 +64,8 @@ def fake_embed(path, payload):
 
 
 fake_embed.calls = 0
+# Настоящая функция нужна разделу про повторы: там подменяется urlopen, а не она.
+REAL_OPENAI_REQUEST = server.openai_request
 server.openai_request = fake_embed
 
 OK = FAIL = 0
@@ -91,7 +103,7 @@ def wait_ready(book_id, timeout=20):
     while time.time() < deadline:
         with server.db() as conn:
             row = conn.execute("SELECT status, error FROM books WHERE id = ?", (book_id,)).fetchone()
-        if row and row["status"] != "indexing":
+        if row and row["status"] not in ("queued", "indexing"):
             return row["status"], row["error"]
         time.sleep(0.05)
     return "timeout", None
@@ -935,6 +947,173 @@ with server.db() as conn:
 check("после миграции чужого имени нет ни в одном аккаунте", left == 0)
 server.purge_user(FRESH_ID)
 server.purge_user(FILLED["id"])
+
+print("\n=== Повторы запросов к OpenAI и Claude ===")
+
+
+def http_error(code, headers=None):
+    hdrs = Message()
+    for key, value in (headers or {}).items():
+        hdrs[key] = value
+    return HTTPError("https://api.example/v1/x", code, "err", hdrs, io.BytesIO(b'{"error": "x"}'))
+
+
+class FakeResponse:
+    def __init__(self, body):
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def read(self):
+        return self.body
+
+
+sleeps = []
+server._retry_sleep = sleeps.append
+real_urlopen = server.urlopen
+calls = []
+
+
+def flaky_urlopen(request, timeout=0):
+    calls.append(request)
+    if len(calls) == 1:
+        raise http_error(429, {"Retry-After": "7"})
+    if len(calls) == 2:
+        raise URLError("connection reset")
+    return FakeResponse(b'{"data": [{"embedding": [1.0]}]}')
+
+
+server.urlopen = flaky_urlopen
+result = REAL_OPENAI_REQUEST("embeddings", {"input": ["x"]})
+check("после 429 и обрыва связи третья попытка проходит",
+      result == {"data": [{"embedding": [1.0]}]} and len(calls) == 3, f"({len(calls)} попыток)")
+check("перед каждым повтором была пауза", len(sleeps) == 2 and all(s > 0 for s in sleeps), f"({sleeps})")
+check("Retry-After от провайдера увеличивает паузу", sleeps and sleeps[0] >= 7, f"({sleeps})")
+check("пауза не превышает потолок", all(s <= server.API_RETRY_MAX_SECONDS for s in sleeps))
+check("каждая попытка — отдельный Request с тем же телом",
+      calls[0] is not calls[1] and all(r.data == calls[0].data for r in calls))
+
+calls.clear()
+sleeps.clear()
+
+
+def always_429(request, timeout=0):
+    calls.append(request)
+    raise http_error(429)
+
+
+server.urlopen = always_429
+try:
+    REAL_OPENAI_REQUEST("embeddings", {"input": ["x"]})
+    message = ""
+except server.ClientError as error:
+    message = str(error)
+check("после исчерпания попыток — понятная ошибка про лимит", "ограничил частоту" in message, f"({message})")
+check("попыток ровно API_RETRIES + 1", len(calls) == server.API_RETRIES + 1, f"({len(calls)})")
+check("пауз ровно API_RETRIES, и они растут",
+      len(sleeps) == server.API_RETRIES and all(b >= a for a, b in zip(sleeps, sleeps[1:])), f"({sleeps})")
+
+calls.clear()
+sleeps.clear()
+
+
+def bad_key(request, timeout=0):
+    calls.append(request)
+    raise http_error(401)
+
+
+server.urlopen = bad_key
+try:
+    REAL_OPENAI_REQUEST("embeddings", {"input": ["x"]})
+    message = ""
+except server.ClientError as error:
+    message = str(error)
+check("401 не повторяется: одна попытка и ошибка про ключ",
+      len(calls) == 1 and not sleeps and "ключ" in message, f"({len(calls)}, {message})")
+check("TimeoutError считается временной ошибкой", server.is_retryable(TimeoutError()))
+check("400 не считается временной ошибкой", not server.is_retryable(http_error(400)))
+check("Retry-After в формате даты разбирается",
+      server.retry_after_seconds(http_error(503, {"Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"})) == 0.0)
+
+calls.clear()
+sleeps.clear()
+server.ANTHROPIC_API_KEY = "test-anthropic-key"
+
+
+def claude_once_down(request, timeout=0):
+    calls.append(request)
+    if len(calls) == 1:
+        raise http_error(503)
+    return FakeResponse(json.dumps({"content": [{"type": "text", "text": "Ответ Claude"}]}).encode())
+
+
+server.urlopen = claude_once_down
+check("Claude: после 503 повтор возвращает ответ",
+      server.claude_request("i", "p", 100) == "Ответ Claude" and len(calls) == 2 and len(sleeps) == 1)
+server.ANTHROPIC_API_KEY = ""
+server.urlopen = real_urlopen
+server._retry_sleep = time.sleep
+
+print("\n=== Очередь индексации переживает перезапуск ===")
+resume_path = server.UPLOADS_DIR / "r1_resume.txt"
+resume_path.write_text("Перезапуск сервиса не должен терять книгу из очереди. " * 300, encoding="utf-8")
+INSERT_BOOK = ("INSERT INTO books (id, user_id, filename, title, extension, stored_path, status, created_at)"
+               " VALUES (?,?,?,?,?,?,?,?)")
+with server.db() as conn:
+    conn.execute(INSERT_BOOK, ("r1", UID, "resume.txt", "Ждала очереди", ".txt", str(resume_path), "queued", "2026-01-01T00:00:01"))
+    conn.execute(INSERT_BOOK, ("r2", UID, "cut.txt", "Оборвана на середине", ".txt", str(resume_path), "indexing", "2026-01-01T00:00:02"))
+    conn.execute(INSERT_BOOK, ("r3", UID, "gone.txt", "Файл пропал", ".txt", str(server.UPLOADS_DIR / "nope.txt"), "queued", "2026-01-01T00:00:03"))
+listing = {book["id"]: book for book in server.list_books(UID)}
+check("книга в очереди помечена флагом indexing ещё до старта воркера", listing["r1"]["indexing"] is True)
+resumed = server.resume_interrupted_indexing()
+check("две книги с файлом вернулись в очередь", resumed == 2, f"({resumed})")
+check("ожидавшая очереди книга доиндексирована", wait_ready("r1")[0] == "ready")
+check("оборванная книга доиндексирована", wait_ready("r2")[0] == "ready")
+status, err = wait_ready("r3")
+check("книга без файла помечена failed с объяснением", status == "failed" and "не найден" in (err or ""), f"({status} / {err})")
+check("повторный запуск при пустой очереди ничего не трогает", server.resume_interrupted_indexing() == 0)
+check("переиндексация отвечает статусом queued", server.reindex_book(UID, "r1")["status"] == "queued")
+check("и доводит книгу до ready", wait_ready("r1")[0] == "ready")
+for book_id in ("r1", "r2", "r3"):
+    server.delete_book(UID, book_id)
+
+print("\n=== Structured Outputs для занятий ===")
+text_format = (fake_generate.last_payload or {}).get("text", {}).get("format", {})
+check("генерация занятия запрашивает json_schema в strict-режиме",
+      text_format.get("type") == "json_schema" and text_format.get("strict") is True, f"({text_format.keys()})")
+check("передана именно схема занятия", text_format.get("schema") is server.LESSON_SCHEMA)
+
+
+def strict_ok(node):
+    """OpenAI strict mode: у объектов все поля required и additionalProperties=false."""
+    if node.get("type") == "object":
+        props = node.get("properties", {})
+        if node.get("additionalProperties") is not False or set(node.get("required", [])) != set(props):
+            return False
+        return all(strict_ok(child) for child in props.values())
+    if node.get("type") == "array":
+        return strict_ok(node["items"])
+    return True
+
+
+check("схема занятия удовлетворяет требованиям strict", strict_ok(server.LESSON_SCHEMA))
+check("в схеме есть все поля, которые читает clean_lesson_payload",
+      {"title", "goal", "summary", "key_ideas", "terms", "quotes", "practice", "questions", "flashcards"}
+      <= set(server.LESSON_SCHEMA["properties"]))
+check("llm_json без схемы не добавляет text.format",
+      (server.llm_json("i", "p") or True) and "text" not in fake_generate.last_payload)
+server.openai_request = lambda path, payload: {"output": [{"content": [{"type": "refusal", "refusal": "нет"}]}]}
+check("отказ модели -> ClientError, а не пустой JSON", raises(server.llm_json, "i", "p", schema=server.LESSON_SCHEMA))
+server.openai_request = lambda path, payload: {
+    "status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"},
+    "output": [{"content": [{"type": "output_text", "text": '{"title": "обрыв'}]}],
+}
+check("оборванный ответ -> ClientError", raises(server.llm_json, "i", "p"))
+server.openai_request = fake_embed
 
 print("\n" + "=" * 54)
 print(f"ИТОГО: {OK} пройдено, {FAIL} провалено")
